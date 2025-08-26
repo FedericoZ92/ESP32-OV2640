@@ -1,0 +1,24 @@
+# Ignore the my_folder directory
+#my_folder/
+
+# Ignore the build directory anywhere in the repository
+#build/
+
+# Ignore all .log files
+#*.log
+
+# Ignore node_modules directory
+#node_modules/
+
+./build
+./build/
+.vscode/
+.vscode
+.vscode/c_cpp_properties.json
+build/
+/build*/
+sdkconfig
+./builds
+./builds/
+builds/
+/builds*/
