@@ -1,6 +1,8 @@
 #pragma once
 
-#include "esp_camera.h"
+extern "C" {
+    #include "esp_camera.h"
+}
 #include "esp_err.h"
 #include <cstdint>
 
