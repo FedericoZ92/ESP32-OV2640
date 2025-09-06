@@ -5,22 +5,28 @@
 static const char *TAG = "CameraDriver";
 
 // Define OV2640 Camera Pin Mapping (adjust for your board)
-#define PWDN_GPIO_NUM    -1
-#define RESET_GPIO_NUM   -1
-#define XCLK_GPIO_NUM    45
-#define SIOD_GPIO_NUM    1
-#define SIOC_GPIO_NUM    2
-#define Y2_GPIO_NUM      39  // D0
-#define Y3_GPIO_NUM      40  // D1
-#define Y4_GPIO_NUM      41  // D2
-#define Y5_GPIO_NUM       4  // D3
-#define Y6_GPIO_NUM       7  // D4
-#define Y7_GPIO_NUM       8  // D5
-#define Y8_GPIO_NUM      46  // D6
-#define Y9_GPIO_NUM      48  // D7
+// Power / Reset
+#define PWDN_GPIO_NUM    -1   // Power-down pin not used
+#define RESET_GPIO_NUM   -1   // Reset pin not used
+// Clock
+#define XCLK_GPIO_NUM    45   // Camera XCLK input
+#define PCLK_GPIO_NUM     5   // Pixel clock output from camera
+// SCCB (I2C-like) interface
+#define SIOD_GPIO_NUM     1   // SDA
+#define SIOC_GPIO_NUM     2   // SCL
+// Camera data pins
+#define Y2_GPIO_NUM      39   // D0
+#define Y3_GPIO_NUM      40   // D1
+#define Y4_GPIO_NUM      41   // D2
+#define Y5_GPIO_NUM       4   // D3
+#define Y6_GPIO_NUM       7   // D4
+#define Y7_GPIO_NUM       8   // D5
+#define Y8_GPIO_NUM      46   // D6
+#define Y9_GPIO_NUM      48   // D7
+
+// Sync signals
 #define VSYNC_GPIO_NUM    6
-#define HREF_GPIO_NUM     42
-#define PCLK_GPIO_NUM     5
+#define HREF_GPIO_NUM    42
 
 CameraDriver::CameraDriver() {
     configureCamera();
