@@ -33,19 +33,19 @@ extern "C" void app_main(void)
     }
 
     camera_fb_t* fb = camera.captureFrame();
-if (fb) {
-    char line[128];
-    size_t line_len = 0;
-    for (size_t i = 0; i < fb->len; i++) {
-        line_len += snprintf(line + line_len, sizeof(line) - line_len, "%02X ", fb->buf[i]);
-        if ((i + 1) % 16 == 0 || i == fb->len - 1) {
-            ESP_LOGI(OV2640_TAG, "%s", line);
-            line_len = 0;
+    if (fb) {
+        char line[128];
+        size_t line_len = 0;
+        for (size_t i = 0; i < fb->len; i++) {
+            line_len += snprintf(line + line_len, sizeof(line) - line_len, "%02X ", fb->buf[i]);
+            if ((i + 1) % 16 == 0 || i == fb->len - 1) {
+                ESP_LOGI(OV2640_TAG, "%s", line);
+                line_len = 0;
+            }
         }
+        ESP_LOGI(OV2640_TAG, "Total bytes: %zu", fb->len);
+        camera.releaseFrame(fb);
     }
-    ESP_LOGI(OV2640_TAG, "Total bytes: %zu", fb->len);
-    camera.releaseFrame(fb);
-}
 
     // Restart countdown
     for (int i = 10; i >= 0; i--) {
