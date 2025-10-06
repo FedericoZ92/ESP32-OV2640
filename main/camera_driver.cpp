@@ -5,6 +5,7 @@
 static const char *TAG = "CameraDriver";
 
 // OV2640 pin map for ESP32-S3-CAM-N16R8
+// https://www.oceanlabz.in/getting-started-with-esp32-s3-wroom-n16r8-cam-dev-board/?srsltid=AfmBOors-1xeo_-CM5mcneEFHgQY9ps0qX2SHt8gf-S7Ndizot0T4vzk
 // in docs: schematics file from: https://www.homotix.it/vendita/moduli-wi-fi/scheda-esp32-s3-n16r8
 // https://github.com/microrobotics/ESP32-S3-N16R8/blob/main/ESP32-S3-N16R8_User_Guide.pdf
 #define PWDN_GPIO_NUM     -1   // Power down not used
