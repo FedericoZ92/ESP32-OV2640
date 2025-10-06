@@ -5,6 +5,7 @@
 static const char *TAG = "CameraDriver";
 
 // OV2640 pin map for ESP32-S3-CAM-N16R8
+// https://github.com/microrobotics/ESP32-S3-N16R8/blob/main/ESP32-S3-N16R8_User_Guide.pdf
 #define PWDN_GPIO_NUM     -1   // Power down not used
 #define RESET_GPIO_NUM    -1   // Reset not used
 #define XCLK_GPIO_NUM     15   // External clock to camera
