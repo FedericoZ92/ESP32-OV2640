@@ -8,6 +8,8 @@
 #include "esp_flash.h"
 #include "camera_driver.h"
 
+#include "config.h"
+
 #define OV2640_TAG "ov2640"
 
 extern "C" void app_main(void)
@@ -24,6 +26,18 @@ extern "C" void app_main(void)
         return;
     }
     ESP_LOGI(OV2640_TAG, "Flash size: %" PRIu32 " MB", flash_size / (1024*1024));
+
+    // --- CAMERA RESET SEQUENCE ---
+    gpio_reset_pin((gpio_num_t)PWDN_GPIO_NUM);
+    gpio_reset_pin((gpio_num_t)RESET_GPIO_NUM);
+    gpio_set_direction((gpio_num_t)PWDN_GPIO_NUM, GPIO_MODE_OUTPUT);
+    gpio_set_direction((gpio_num_t)RESET_GPIO_NUM, GPIO_MODE_OUTPUT);
+
+    gpio_set_level((gpio_num_t)PWDN_GPIO_NUM, 0);  // Power on
+    gpio_set_level((gpio_num_t)RESET_GPIO_NUM, 0); // Hold reset
+    vTaskDelay(pdMS_TO_TICKS(10));     // Wait 10 ms
+    gpio_set_level((gpio_num_t)RESET_GPIO_NUM, 1); // Release reset
+    vTaskDelay(pdMS_TO_TICKS(50));     // Wait 50 ms for camera startup
 
     // Camera
     CameraDriver camera;
