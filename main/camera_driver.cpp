@@ -25,9 +25,6 @@ static const char *TAG = "CameraDriver";
 #define HREF_GPIO_NUM      7
 #define PCLK_GPIO_NUM     13
 // Sync signals
-#define VSYNC_GPIO_NUM    6
-#define HREF_GPIO_NUM    42
-
 
 CameraDriver::CameraDriver() {
     configureCamera();

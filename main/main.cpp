@@ -37,7 +37,7 @@ extern "C" void app_main(void)
     gpio_set_level((gpio_num_t)RESET_GPIO_NUM, 0); // Hold reset
     vTaskDelay(pdMS_TO_TICKS(10));     // Wait 10 ms
     gpio_set_level((gpio_num_t)RESET_GPIO_NUM, 1); // Release reset
-    vTaskDelay(pdMS_TO_TICKS(50));     // Wait 50 ms for camera startup
+   vTaskDelay(pdMS_TO_TICKS(100)); // Wait longer for camera startup
 
     // Camera
     CameraDriver camera;
