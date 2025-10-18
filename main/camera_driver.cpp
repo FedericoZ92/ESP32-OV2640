@@ -61,7 +61,7 @@ void CameraDriver::configureCamera() {
     config.frame_size = FRAMESIZE_QVGA;
     config.jpeg_quality = 10;
     config.fb_count = 1;
-    config.fb_location = CAMERA_FB_IN_DRAM;  // Store in internal RAM
+    config.fb_location = CAMERA_FB_IN_PSRAM, //CAMERA_FB_IN_DRAM; Store in internal RAM
 }
 
 esp_err_t CameraDriver::init() {
