@@ -7,10 +7,15 @@
 #include "esp_chip_info.h"
 #include "esp_flash.h"
 #include "camera_driver.h"
+#include "http-server.h"
+#include "wifi.h"
 
 #include "config.h"
 
 #define OV2640_TAG "ov2640"
+
+CameraHttpServer server;
+WifiManager wifi;
 
 extern "C" void app_main(void)
 {
@@ -37,7 +42,7 @@ extern "C" void app_main(void)
     gpio_set_level((gpio_num_t)RESET_GPIO_NUM, 0); // Hold reset
     vTaskDelay(pdMS_TO_TICKS(10));     // Wait 10 ms
     gpio_set_level((gpio_num_t)RESET_GPIO_NUM, 1); // Release reset
-   vTaskDelay(pdMS_TO_TICKS(100)); // Wait longer for camera startup
+    vTaskDelay(pdMS_TO_TICKS(100)); // Wait longer for camera startup
 
     // Camera
     CameraDriver camera;
@@ -45,7 +50,6 @@ extern "C" void app_main(void)
         ESP_LOGE(OV2640_TAG, "Camera initialization failed");
         return;
     }
-
     camera_fb_t* fb = camera.captureFrame();
     if (fb) {
         char line[128];
@@ -59,6 +63,34 @@ extern "C" void app_main(void)
         }
         ESP_LOGI(OV2640_TAG, "Total bytes: %zu", fb->len);
         camera.releaseFrame(fb);
+    }
+
+    // wifi
+    wifi.init();
+    // Choose one of:
+    //wifi.initAP("ESP32-CAM", "12345678");           // Access Point mode
+    wifi.initSTA("YourSSID", "YourPassword");         // Station mode
+
+    // http server
+    server.setCaptureHandler([](httpd_req_t *req) -> esp_err_t {
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (!fb) {
+            httpd_resp_send_500(req);
+            return ESP_FAIL;
+        }
+        httpd_resp_set_type(req, "image/jpeg");
+        esp_err_t res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
+        esp_camera_fb_return(fb);
+        return res;
+    });
+
+    if (server.start() == ESP_OK)
+        ESP_LOGI(TAG, "HTTP Server started. Open http://%s/capture.jpg",
+                 wifi.getLocalIP().c_str());
+}
+
+    if (server.start() == ESP_OK) {
+        ESP_LOGI(TAG, "Server started successfully");
     }
 
     // Restart countdown
