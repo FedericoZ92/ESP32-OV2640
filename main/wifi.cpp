@@ -1,6 +1,9 @@
+
 #include "wifi.h"
+#include <cstring>
 #include "esp_netif_ip_addr.h"
 #include "esp_log.h"
+#include "debug.h"
 
 bool WifiManager::s_connected = false;
 int WifiManager::s_retryCount = 0;
@@ -44,9 +47,9 @@ esp_err_t WifiManager::initAP(const std::string &ssid,
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "Wi-Fi AP started. SSID: %s, PASS: %s", ssid.c_str(),
+    ESP_LOGI(OV2640_TAG, "Wi-Fi AP started. SSID: %s, PASS: %s", ssid.c_str(),
              password.empty() ? "<open>" : password.c_str());
-    ESP_LOGI(TAG, "Access Point IP: 192.168.4.1");
+    ESP_LOGI(OV2640_TAG, "Access Point IP: 192.168.4.1");
 
     return ESP_OK;
 }
@@ -71,7 +74,7 @@ esp_err_t WifiManager::initSTA(const std::string &ssid,
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "Connecting to SSID:%s ...", ssid.c_str());
+    ESP_LOGI(OV2640_TAG, "Connecting to SSID:%s ...", ssid.c_str());
 
     s_retryCount = 0;
     while (!s_connected && s_retryCount < max_retry) {
@@ -79,9 +82,9 @@ esp_err_t WifiManager::initSTA(const std::string &ssid,
     }
 
     if (s_connected)
-        ESP_LOGI(TAG, "Connected to Wi-Fi network");
+        ESP_LOGI(OV2640_TAG, "Connected to Wi-Fi network");
     else
-        ESP_LOGW(TAG, "Failed to connect after %d retries", s_retryCount);
+        ESP_LOGW(OV2640_TAG, "Failed to connect after %d retries", s_retryCount);
 
     return ESP_OK;
 }

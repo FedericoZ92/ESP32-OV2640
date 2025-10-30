@@ -9,10 +9,8 @@
 #include "camera_driver.h"
 #include "http-server.h"
 #include "wifi.h"
-
+#include "debug.h"
 #include "config.h"
-
-#define OV2640_TAG "ov2640"
 
 CameraHttpServer server;
 WifiManager wifi;
@@ -69,7 +67,7 @@ extern "C" void app_main(void)
     wifi.init();
     // Choose one of:
     //wifi.initAP("ESP32-CAM", "12345678");           // Access Point mode
-    wifi.initSTA("YourSSID", "YourPassword");         // Station mode
+    wifi.initSTA("FedericoGA35", "chapischapis");         // Station mode
 
     // http server
     server.setCaptureHandler([](httpd_req_t *req) -> esp_err_t {
@@ -84,13 +82,12 @@ extern "C" void app_main(void)
         return res;
     });
 
-    if (server.start() == ESP_OK)
-        ESP_LOGI(TAG, "HTTP Server started. Open http://%s/capture.jpg",
-                 wifi.getLocalIP().c_str());
-}
+    if (server.start() == ESP_OK){
+        ESP_LOGI(OV2640_TAG, "HTTP Server started. Open http://%s/capture.jpg", wifi.getLocalIP().c_str());
+    }
 
     if (server.start() == ESP_OK) {
-        ESP_LOGI(TAG, "Server started successfully");
+        ESP_LOGI(OV2640_TAG, "Server started successfully");
     }
 
     // Restart countdown
