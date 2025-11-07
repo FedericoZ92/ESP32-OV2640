@@ -48,6 +48,15 @@ extern "C" void app_main(void)
         ESP_LOGE(OV2640_TAG, "Camera initialization failed");
         return;
     }
+    // Flip image 180° (do this right after init)
+    sensor_t *s = esp_camera_sensor_get();
+    if (s) {
+        s->set_vflip(s, 1);   // vertical flip
+        s->set_hmirror(s, 1); // horizontal mirror
+        ESP_LOGI(OV2640_TAG, "Camera image flipped 180°");
+    } else {
+        ESP_LOGW(OV2640_TAG, "Failed to get camera sensor handle for flipping");
+    }
     camera_fb_t* fb = camera.captureFrame();
     if (fb) {
         char line[128];
@@ -84,15 +93,15 @@ extern "C" void app_main(void)
 
     if (server.start() == ESP_OK){
         ESP_LOGI(OV2640_TAG, "HTTP Server started. Open http://%s/capture.jpg", wifi.getLocalIP().c_str());
-    }
-
-    if (server.start() == ESP_OK) {
-        ESP_LOGI(OV2640_TAG, "Server started successfully");
+    }else{
+        ESP_LOGE(OV2640_TAG, "Server not started");
     }
 
     // Restart countdown
-    for (int i = 10; i >= 0; i--) {
-        ESP_LOGI(OV2640_TAG, "Restarting in %d seconds...", i);
+    for (int i = 100; i >= 0; i--) {
+        if (i <= 10){
+            ESP_LOGI(OV2640_TAG, "Restarting in %d seconds...", i);
+        }
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
     ESP_LOGI(OV2640_TAG, "Restarting now.");
