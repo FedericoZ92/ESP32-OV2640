@@ -19,6 +19,8 @@ public:
 
 private:
     static esp_err_t handleCapture(httpd_req_t *req);
+    static esp_err_t handleIndex(httpd_req_t *req);
+
     static inline const char *TAG = "CameraHttpServer";
 
     static CaptureCallback s_captureCallback;

@@ -8,4 +8,4 @@ include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(ov2640)
 
 # Include directories for global visibility (optional)
-include_directories(components/esp32-camera-f)
+#include_directories(components/esp32-camera-f)

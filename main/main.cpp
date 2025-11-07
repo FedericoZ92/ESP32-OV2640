@@ -133,8 +133,8 @@ extern "C" void app_main(void)
     }
 
     // --- Run for 60 seconds, then reboot ---
-    const uint32_t run_time_ms = 60000;  // 1 minute
-    ESP_LOGI(OV2640_TAG, "System will reboot in %u seconds...", run_time_ms / 1000);
+    const uint32_t run_time_ms = 300000;  // 1 minute
+    ESP_LOGD(OV2640_TAG, "System will reboot in %d seconds...", (int)(run_time_ms / 1000));
     vTaskDelay(pdMS_TO_TICKS(run_time_ms));
 
     ESP_LOGW(OV2640_TAG, "Rebooting system after 1 minute...");
