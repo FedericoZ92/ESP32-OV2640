@@ -131,4 +131,12 @@ extern "C" void app_main(void)
     } else {
         ESP_LOGE(OV2640_TAG, "Failed to create frame mutex");
     }
+
+    // --- Run for 60 seconds, then reboot ---
+    const uint32_t run_time_ms = 60000;  // 1 minute
+    ESP_LOGI(OV2640_TAG, "System will reboot in %u seconds...", run_time_ms / 1000);
+    vTaskDelay(pdMS_TO_TICKS(run_time_ms));
+
+    ESP_LOGW(OV2640_TAG, "Rebooting system after 1 minute...");
+    esp_restart();   // clean software reboot
 }
