@@ -59,6 +59,7 @@ void CameraDriver::configureCamera() {
     config.jpeg_quality = 10;
     config.fb_count = 1;
     config.fb_location = CAMERA_FB_IN_DRAM; //Store in internal RAM
+    config.grab_mode = CAMERA_GRAB_LATEST;
 }
 
 esp_err_t CameraDriver::init() {

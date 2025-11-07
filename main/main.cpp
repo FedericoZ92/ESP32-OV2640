@@ -1,24 +1,75 @@
-
 #include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_system.h"
 #include "esp_log.h"
 #include "esp_chip_info.h"
 #include "esp_flash.h"
+#include "esp_camera.h"
 #include "camera_driver.h"
 #include "http-server.h"
 #include "wifi.h"
 #include "debug.h"
 #include "config.h"
+#include <vector>
 
 CameraHttpServer server;
 WifiManager wifi;
 
+// Shared frame buffer
+static std::vector<uint8_t> latest_frame;
+static SemaphoreHandle_t frame_mutex = nullptr;
+
+// Background task: capture a new frame every second
+void capture_task(void *arg)
+{
+    ESP_LOGI(CAPTURE_TAG, "Camera capture task started");
+
+    while (true) {
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (fb) {
+            if (xSemaphoreTake(frame_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                latest_frame.assign(fb->buf, fb->buf + fb->len);
+                xSemaphoreGive(frame_mutex);
+            }
+            esp_camera_fb_return(fb);
+            ESP_LOGI(CAPTURE_TAG, "Captured frame: %u bytes", (unsigned)latest_frame.size());
+        } else {
+            ESP_LOGW(CAPTURE_TAG, "Camera capture failed");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1000)); // 1 second interval
+    }
+}
+
+// HTTP handler — returns the latest captured frame
+esp_err_t capture_http_handler(httpd_req_t *req)
+{
+    if (xSemaphoreTake(frame_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    if (latest_frame.empty()) {
+        xSemaphoreGive(frame_mutex);
+        httpd_resp_send_500(req);
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "image/jpeg");
+    esp_err_t res = httpd_resp_send(req,
+                                    reinterpret_cast<const char *>(latest_frame.data()),
+                                    latest_frame.size());
+    xSemaphoreGive(frame_mutex);
+    return res;
+}
+
 extern "C" void app_main(void)
 {
-    esp_log_level_set("*", ESP_LOG_VERBOSE); 
-    // Print chip info
+    esp_log_level_set("*", ESP_LOG_VERBOSE);
+
+    // --- Print chip info ---
     esp_chip_info_t chip_info;
     uint32_t flash_size;
     esp_chip_info(&chip_info);
@@ -28,7 +79,7 @@ extern "C" void app_main(void)
         ESP_LOGE(OV2640_TAG, "Get flash size failed");
         return;
     }
-    ESP_LOGI(OV2640_TAG, "Flash size: %" PRIu32 " MB", flash_size / (1024*1024));
+    ESP_LOGI(OV2640_TAG, "Flash size: %" PRIu32 " MB", flash_size / (1024 * 1024));
 
     // --- CAMERA RESET SEQUENCE ---
     gpio_reset_pin((gpio_num_t)PWDN_GPIO_NUM);
@@ -38,72 +89,46 @@ extern "C" void app_main(void)
 
     gpio_set_level((gpio_num_t)PWDN_GPIO_NUM, 0);  // Power on
     gpio_set_level((gpio_num_t)RESET_GPIO_NUM, 0); // Hold reset
-    vTaskDelay(pdMS_TO_TICKS(10));     // Wait 10 ms
+    vTaskDelay(pdMS_TO_TICKS(10));
     gpio_set_level((gpio_num_t)RESET_GPIO_NUM, 1); // Release reset
-    vTaskDelay(pdMS_TO_TICKS(100)); // Wait longer for camera startup
+    vTaskDelay(pdMS_TO_TICKS(100));
 
-    // Camera
+    // --- Camera initialization ---
     CameraDriver camera;
     if (camera.init() != ESP_OK) {
         ESP_LOGE(OV2640_TAG, "Camera initialization failed");
         return;
     }
-    // Flip image 180° (do this right after init)
+
+    // Flip image 180°
     sensor_t *s = esp_camera_sensor_get();
     if (s) {
-        s->set_vflip(s, 1);   // vertical flip
-        s->set_hmirror(s, 1); // horizontal mirror
+        s->set_vflip(s, 1);
+        s->set_hmirror(s, 1);
         ESP_LOGI(OV2640_TAG, "Camera image flipped 180°");
     } else {
         ESP_LOGW(OV2640_TAG, "Failed to get camera sensor handle for flipping");
     }
-    camera_fb_t* fb = camera.captureFrame();
-    if (fb) {
-        char line[128];
-        size_t line_len = 0;
-        for (size_t i = 0; i < fb->len; i++) {
-            line_len += snprintf(line + line_len, sizeof(line) - line_len, "%02X ", fb->buf[i]);
-            if ((i + 1) % 16 == 0 || i == fb->len - 1) {
-                ESP_LOGI(OV2640_TAG, "%s", line);
-                line_len = 0;
-            }
-        }
-        ESP_LOGI(OV2640_TAG, "Total bytes: %zu", fb->len);
-        camera.releaseFrame(fb);
-    }
 
-    // wifi
+    // --- Wi-Fi initialization ---
     wifi.init();
-    // Choose one of:
-    //wifi.initAP("ESP32-CAM", "12345678");           // Access Point mode
-    wifi.initSTA("FedericoGA35", "chapischapis");         // Station mode
+    wifi.initSTA("FedericoGA35", "chapischapis"); // connect to your network
 
-    // http server
-    server.setCaptureHandler([](httpd_req_t *req) -> esp_err_t {
-        camera_fb_t *fb = esp_camera_fb_get();
-        if (!fb) {
-            httpd_resp_send_500(req);
-            return ESP_FAIL;
-        }
-        httpd_resp_set_type(req, "image/jpeg");
-        esp_err_t res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
-        esp_camera_fb_return(fb);
-        return res;
-    });
+    // --- HTTP server setup ---
+    server.setCaptureHandler(capture_http_handler);
 
-    if (server.start() == ESP_OK){
+    if (server.start() == ESP_OK) {
         ESP_LOGI(OV2640_TAG, "HTTP Server started. Open http://%s/capture.jpg", wifi.getLocalIP().c_str());
-    }else{
-        ESP_LOGE(OV2640_TAG, "Server not started");
+    } else {
+        ESP_LOGE(OV2640_TAG, "HTTP Server not started");
     }
 
-    // Restart countdown
-    for (int i = 100; i >= 0; i--) {
-        if (i <= 10){
-            ESP_LOGI(OV2640_TAG, "Restarting in %d seconds...", i);
-        }
-        vTaskDelay(pdMS_TO_TICKS(1000));
+    // --- Start capture task ---
+    frame_mutex = xSemaphoreCreateMutex();
+    if (frame_mutex) {
+        xTaskCreate(capture_task, "capture_task", 8192, nullptr, 5, nullptr);
+        ESP_LOGI(OV2640_TAG, "Started periodic capture task");
+    } else {
+        ESP_LOGE(OV2640_TAG, "Failed to create frame mutex");
     }
-    ESP_LOGI(OV2640_TAG, "Restarting now.");
-    esp_restart();
 }
