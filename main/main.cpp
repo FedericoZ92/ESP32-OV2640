@@ -39,7 +39,7 @@ void capture_task(void *arg)
             ESP_LOGW(CAPTURE_TAG, "Camera capture failed");
         }
 
-        vTaskDelay(pdMS_TO_TICKS(1000)); // 1 second interval
+        vTaskDelay(pdMS_TO_TICKS(5000)); // 5 second interval
     }
 }
 
