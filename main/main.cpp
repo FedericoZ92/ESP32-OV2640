@@ -12,6 +12,8 @@
 #include "wifi.h"
 #include "debug.h"
 #include "config.h"
+#include "tf-lite.h"
+#include "tflite-person-detect/person_detect_model_data.h"
 #include <vector>
 
 CameraHttpServer server;
@@ -20,6 +22,8 @@ WifiManager wifi;
 // Shared frame buffer
 static std::vector<uint8_t> latest_frame;
 static SemaphoreHandle_t frame_mutex = nullptr;
+// --- Initialize TensorFlow Lite wrapper ---
+static TfLiteWrapper tf_wrapper(g_person_detect_model_data, 10 * 1024);
 
 // Background task: capture a new frame every second
 void capture_task(void *arg)
@@ -32,13 +36,19 @@ void capture_task(void *arg)
             if (xSemaphoreTake(frame_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
                 latest_frame.assign(fb->buf, fb->buf + fb->len);
                 xSemaphoreGive(frame_mutex);
+
+                // Run person detection on this frame
+                bool person_present = tf_wrapper.runInference(latest_frame.data(), fb->width, fb->height);
+                if (person_present) {
+                    ESP_LOGI(TF_TAG, "Person detected in frame!");
+                } else {
+                    ESP_LOGI(TF_TAG, "No person detected");
+                }
             }
             esp_camera_fb_return(fb);
-            ESP_LOGI(CAPTURE_TAG, "Captured frame: %u bytes", (unsigned)latest_frame.size());
-        } else {
-            ESP_LOGW(CAPTURE_TAG, "Camera capture failed");
         }
 
+        ESP_LOGI(CAPTURE_TAG, "Captured frame: %u bytes", (unsigned)latest_frame.size());
         vTaskDelay(pdMS_TO_TICKS(5000)); // 5 second interval
     }
 }
@@ -73,7 +83,7 @@ extern "C" void app_main(void)
     esp_chip_info_t chip_info;
     uint32_t flash_size;
     esp_chip_info(&chip_info);
-    ESP_LOGI(OV2640_TAG, "This is %s chip with %d CPU core(s)", CONFIG_IDF_TARGET, chip_info.cores);
+    ESP_LOGI(OV2640_TAG, "This is %s chip with %d CPU core(s)", CONFIG_IDF_TARGET, (int)chip_info.cores);
 
     if (esp_flash_get_size(NULL, &flash_size) != ESP_OK) {
         ESP_LOGE(OV2640_TAG, "Get flash size failed");
