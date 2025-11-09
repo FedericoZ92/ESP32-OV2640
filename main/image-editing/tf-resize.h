@@ -1,0 +1,11 @@
+#pragma once
+#include <stdint.h>
+
+// Resize an RGB888 image using nearest neighbor
+// src: pointer to input image (width x height x 3)
+// dst: pointer to output image (out_width x out_height x 3)
+// in_width, in_height: input image dimensions
+// out_width, out_height: output image dimensions
+void resizeNearestNeighbor(const uint8_t* src, int in_width, int in_height,
+                           uint8_t* dst, int out_width, int out_height);
+
