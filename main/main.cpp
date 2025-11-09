@@ -24,22 +24,33 @@ WifiManager wifi;
 static std::vector<uint8_t> latest_frame;
 static SemaphoreHandle_t frame_mutex = nullptr;
 // --- Initialize TensorFlow Lite wrapper ---
-static TfLiteWrapper tf_wrapper(g_person_detect_model_data, 10 * 1024);
+static TfLiteWrapper tf_wrapper(g_person_detect_model_data, 80 * 1024);
 
-// Background task: capture a new frame every second
+// Background task: capture a new frame every 10 seconds
 void capture_task(void *arg)
 {
     ESP_LOGI(CAPTURE_TAG, "Camera capture task started");
-
+    static uint8_t resized_frame[96 * 96 * 3]; // 96x96 RGB buffer
     while (true) {
         camera_fb_t *fb = esp_camera_fb_get();
         if (fb) {
             if (xSemaphoreTake(frame_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                // Copy raw frame to shared buffer (optional, e.g., for HTTP)
                 latest_frame.assign(fb->buf, fb->buf + fb->len);
                 xSemaphoreGive(frame_mutex);
 
-                // Run person detection on this frame
-                bool person_present = tf_wrapper.runInference(latest_frame.data(), fb->width, fb->height);
+                // Resize frame to 96x96 for TFLite model
+                resizeNearestNeighbor(fb->buf, fb->width, fb->height,
+                                      resized_frame, 96, 96);
+
+                ESP_LOGI(TF_TAG, "First 10 pixels: %u %u %u %u %u ...",
+                        resized_frame[0], resized_frame[1], resized_frame[2],
+                        resized_frame[3], resized_frame[4]);
+                //uint8_t* output = tf_wrapper.getOutputDataUint8(); // depends on your wrapper
+                //ESP_LOGI(TF_TAG, "Model output: %u", output[0]); // or output[0..n]
+
+                // Run inference
+                bool person_present = tf_wrapper.runInference(resized_frame, 96, 96);
                 if (person_present) {
                     ESP_LOGI(TF_TAG, "Person detected in frame!");
                 } else {
@@ -48,9 +59,8 @@ void capture_task(void *arg)
             }
             esp_camera_fb_return(fb);
         }
-
         ESP_LOGI(CAPTURE_TAG, "Captured frame: %u bytes", (unsigned)latest_frame.size());
-        vTaskDelay(pdMS_TO_TICKS(5000)); // 5 second interval
+        vTaskDelay(pdMS_TO_TICKS(10000)); // 5 second interval
     }
 }
 

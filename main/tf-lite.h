@@ -9,22 +9,20 @@
 #include "esp_log.h"
 //#include "tflite-person-detect/person_detect_model_data.h"
 #include <cstdint>
+#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 
 
 class TfLiteWrapper {
 public:
-    TfLiteWrapper(const uint8_t* model_data, size_t arena_size = 10 * 1024);
-    ~TfLiteWrapper();
+    TfLiteWrapper(const unsigned char* model_data, size_t arena_size = 10*1024);
 
-    // Process a frame (to be implemented later)
-    bool runInference(const uint8_t* frame_data, int width, int height) { return false; }
+    bool runInference(const uint8_t* image_data, int width, int height);
+    uint8_t* getOutputDataUint8() const;
 
 private:
-    const tflite::Model* model = nullptr;
-    tflite::MicroInterpreter* interpreter = nullptr;
-    uint8_t* tensor_arena = nullptr;
-    size_t arena_size_bytes = 0;
-
-    // Resolver placeholder — may switch to AllOpsResolver if available
-    tflite::MicroMutableOpResolver<10> resolver;
+    const tflite::Model* model;
+    tflite::MicroInterpreter* interpreter;
+    tflite::MicroMutableOpResolver<10> resolver; // max 10 ops
+    uint8_t* tensor_arena;
+    size_t arena_size;
 };
