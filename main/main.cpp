@@ -23,14 +23,14 @@ WifiManager wifi;
 // Shared frame buffer
 static std::vector<uint8_t> latest_frame;
 static SemaphoreHandle_t frame_mutex = nullptr;
-// --- Initialize TensorFlow Lite wrapper ---
-static TfLiteWrapper tf_wrapper(g_person_detect_model_data, 80 * 1024);
+static TfLiteWrapper tf_wrapper;
 
 // Background task: capture a new frame every 10 seconds
 void capture_task(void *arg)
 {
     ESP_LOGI(CAPTURE_TAG, "Camera capture task started");
-    static uint8_t resized_frame[96 * 96 * 3]; // 96x96 RGB buffer
+    static uint8_t rgb_frame[160 * 120 * 3];     // Adjust based on camera resolution
+    static uint8_t resized_frame[96 * 96 * 3];   // 96x96 RGB buffer for model
     while (true) {
         camera_fb_t *fb = esp_camera_fb_get();
         if (fb) {
@@ -39,16 +39,31 @@ void capture_task(void *arg)
                 latest_frame.assign(fb->buf, fb->buf + fb->len);
                 xSemaphoreGive(frame_mutex);
 
-                // Resize frame to 96x96 for TFLite model
-                resizeNearestNeighbor(fb->buf, fb->width, fb->height,
+                // Decode JPEG to RGB888 if needed
+                if (fb->format == PIXFORMAT_JPEG) {
+                    bool success = fmt2rgb888(fb->buf, fb->len, PIXFORMAT_RGB888, rgb_frame);
+                    if (!success) {
+                        ESP_LOGE(CAPTURE_TAG, "JPEG decode failed");
+                        esp_camera_fb_return(fb);
+                        continue;
+                    }
+                } else {
+                    memcpy(rgb_frame, fb->buf, fb->width * fb->height * 3);
+                }
+                // Resize to 96x96 for TFLite model
+                resizeNearestNeighbor(rgb_frame, fb->width, fb->height,
                                       resized_frame, 96, 96);
 
                 ESP_LOGI(TF_TAG, "First 10 pixels: %u %u %u %u %u ...",
-                        resized_frame[0], resized_frame[1], resized_frame[2],
-                        resized_frame[3], resized_frame[4]);
-                //uint8_t* output = tf_wrapper.getOutputDataUint8(); // depends on your wrapper
-                //ESP_LOGI(TF_TAG, "Model output: %u", output[0]); // or output[0..n]
-
+                         resized_frame[0], resized_frame[1], resized_frame[2],
+                         resized_frame[3], resized_frame[4]);
+                // Log input tensor shape and type
+                TfLiteTensor* input = tf_wrapper.getInputTensor(); // Add this method to your wrapper
+                if (input) {
+                    ESP_LOGI(TF_TAG, "Input tensor type: %d", input->type);
+                    ESP_LOGI(TF_TAG, "Input tensor shape: %d x %d x %d",
+                             input->dims->data[1], input->dims->data[2], input->dims->data[3]);
+                }
                 // Run inference
                 bool person_present = tf_wrapper.runInference(resized_frame, 96, 96);
                 if (person_present) {
@@ -60,7 +75,7 @@ void capture_task(void *arg)
             esp_camera_fb_return(fb);
         }
         ESP_LOGI(CAPTURE_TAG, "Captured frame: %u bytes", (unsigned)latest_frame.size());
-        vTaskDelay(pdMS_TO_TICKS(10000)); // 5 second interval
+        vTaskDelay(pdMS_TO_TICKS(10000)); // 10 second interval
     }
 }
 
@@ -114,6 +129,10 @@ extern "C" void app_main(void)
     gpio_set_level((gpio_num_t)RESET_GPIO_NUM, 1); // Release reset
     vTaskDelay(pdMS_TO_TICKS(100));
 
+    // --- Wi-Fi initialization ---
+    wifi.init();
+    wifi.initSTA("FedericoGA35", "chapischapis"); // connect to your network
+
     // --- Camera initialization ---
     CameraDriver camera;
     if (camera.init() != ESP_OK) {
@@ -131,6 +150,9 @@ extern "C" void app_main(void)
         ESP_LOGW(OV2640_TAG, "Failed to get camera sensor handle for flipping");
     }
 
+    // --- Initialize TensorFlow Lite wrapper ---
+    tf_wrapper = TfLiteWrapper(g_person_detect_model_data, 128 * 1024);
+
     // --- Wi-Fi initialization ---
     wifi.init();
     wifi.initSTA("FedericoGA35", "chapischapis"); // connect to your network
@@ -147,7 +169,7 @@ extern "C" void app_main(void)
     // --- Start capture task ---
     frame_mutex = xSemaphoreCreateMutex();
     if (frame_mutex) {
-        xTaskCreate(capture_task, "capture_task", 8192, nullptr, 5, nullptr);
+        xTaskCreate(capture_task, "capture_task", 16384, nullptr, 5, nullptr);
         ESP_LOGI(OV2640_TAG, "Started periodic capture task");
     } else {
         ESP_LOGE(OV2640_TAG, "Failed to create frame mutex");
