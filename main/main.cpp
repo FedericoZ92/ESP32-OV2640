@@ -14,11 +14,11 @@
 #include "config.h"
 #include "tf-lite.h"
 #include "tflite-person-detect/person_detect_model_data.h"
-#include "image-editing/tf-resize.h"
+#include "image-editing/editing.h"
 #include <vector>
 
-CameraHttpServer server;
-WifiManager wifi;
+//CameraHttpServer server;
+//WifiManager wifi;
 
 // Shared frame buffer
 static std::vector<uint8_t> latest_frame;
@@ -29,53 +29,50 @@ static TfLiteWrapper tf_wrapper;
 void capture_task(void *arg)
 {
     ESP_LOGI(CAPTURE_TAG, "Camera capture task started");
-    static uint8_t rgb_frame[160 * 120 * 3];     // Adjust based on camera resolution
-    static uint8_t resized_frame[96 * 96 * 3];   // 96x96 RGB buffer for model
+
+    static uint8_t resized_frame[96 * 96];  // Grayscale input for model
+
     while (true) {
         camera_fb_t *fb = esp_camera_fb_get();
-        if (fb) {
-            if (xSemaphoreTake(frame_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-                // Copy raw frame to shared buffer (optional, e.g., for HTTP)
-                latest_frame.assign(fb->buf, fb->buf + fb->len);
-                xSemaphoreGive(frame_mutex);
+        if (!fb) {
+            ESP_LOGW(CAPTURE_TAG, "Failed to get frame buffer");
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
 
-                // Decode JPEG to RGB888 if needed
-                if (fb->format == PIXFORMAT_JPEG) {
-                    bool success = fmt2rgb888(fb->buf, fb->len, PIXFORMAT_RGB888, rgb_frame);
-                    if (!success) {
-                        ESP_LOGE(CAPTURE_TAG, "JPEG decode failed");
-                        esp_camera_fb_return(fb);
-                        continue;
-                    }
-                } else {
-                    memcpy(rgb_frame, fb->buf, fb->width * fb->height * 3);
-                }
-                // Resize to 96x96 for TFLite model
-                resizeNearestNeighbor(rgb_frame, fb->width, fb->height,
-                                      resized_frame, 96, 96);
+        ESP_LOGI(CAPTURE_TAG, "Frame: %dx%d, len=%d, format=%d", fb->width, fb->height, fb->len, fb->format);
 
-                ESP_LOGI(TF_TAG, "First 10 pixels: %u %u %u %u %u ...",
-                         resized_frame[0], resized_frame[1], resized_frame[2],
-                         resized_frame[3], resized_frame[4]);
-                // Log input tensor shape and type
-                TfLiteTensor* input = tf_wrapper.getInputTensor(); // Add this method to your wrapper
-                if (input) {
+        bool person_present = false;
+
+        if (xSemaphoreTake(frame_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            latest_frame.assign(fb->buf, fb->buf + fb->len);
+            xSemaphoreGive(frame_mutex);
+
+            if (fb->width >= 96 && fb->height >= 96) {
+                resizeNearestNeighbor(fb->buf, fb->width, fb->height, resized_frame, 96, 96);
+
+                TfLiteTensor* input = tf_wrapper.getInputTensor();
+                if (input && input->dims && input->dims->size >= 4) {
                     ESP_LOGI(TF_TAG, "Input tensor type: %d", input->type);
                     ESP_LOGI(TF_TAG, "Input tensor shape: %d x %d x %d",
                              input->dims->data[1], input->dims->data[2], input->dims->data[3]);
-                }
-                // Run inference
-                bool person_present = tf_wrapper.runInference(resized_frame, 96, 96);
-                if (person_present) {
-                    ESP_LOGI(TF_TAG, "Person detected in frame!");
+
+                    person_present = tf_wrapper.runInference(resized_frame, 96, 96);
+                    ESP_LOGI(TF_TAG, "Person detected? %s", person_present ? "YES" : "NO");
                 } else {
-                    ESP_LOGI(TF_TAG, "No person detected");
+                    ESP_LOGE(TF_TAG, "Input tensor is null or malformed");
                 }
+            } else {
+                ESP_LOGW(CAPTURE_TAG, "Frame too small to resize to 96x96");
             }
-            esp_camera_fb_return(fb);
+        } else {
+            ESP_LOGW(CAPTURE_TAG, "Failed to acquire frame mutex");
         }
+
+        esp_camera_fb_return(fb);
         ESP_LOGI(CAPTURE_TAG, "Captured frame: %u bytes", (unsigned)latest_frame.size());
-        vTaskDelay(pdMS_TO_TICKS(10000)); // 10 second interval
+
+        vTaskDelay(pdMS_TO_TICKS(20000)); // 20 second interval
     }
 }
 
@@ -130,8 +127,8 @@ extern "C" void app_main(void)
     vTaskDelay(pdMS_TO_TICKS(100));
 
     // --- Wi-Fi initialization ---
-    wifi.init();
-    wifi.initSTA("FedericoGA35", "chapischapis"); // connect to your network
+    //wifi.init();
+    //wifi.initSTA("FedericoGA35", "chapischapis"); // connect to your network
 
     // --- Camera initialization ---
     CameraDriver camera;
@@ -151,20 +148,22 @@ extern "C" void app_main(void)
     }
 
     // --- Initialize TensorFlow Lite wrapper ---
+    log_RAM_status();
     tf_wrapper = TfLiteWrapper(g_person_detect_model_data, 128 * 1024);
 
     // --- Wi-Fi initialization ---
-    wifi.init();
-    wifi.initSTA("FedericoGA35", "chapischapis"); // connect to your network
+    log_RAM_status();
+    //wifi.init();
+    //wifi.initSTA("FedericoGA35", "chapischapis"); // connect to your network
 
     // --- HTTP server setup ---
-    server.setCaptureHandler(capture_http_handler);
+    //server.setCaptureHandler(capture_http_handler);
 
-    if (server.start() == ESP_OK) {
+    /*if (server.start() == ESP_OK) {
         ESP_LOGI(OV2640_TAG, "HTTP Server started. Open http://%s/capture.jpg", wifi.getLocalIP().c_str());
     } else {
         ESP_LOGE(OV2640_TAG, "HTTP Server not started");
-    }
+    }*/
 
     // --- Start capture task ---
     frame_mutex = xSemaphoreCreateMutex();

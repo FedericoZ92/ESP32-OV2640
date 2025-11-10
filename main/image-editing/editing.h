@@ -9,3 +9,4 @@
 void resizeNearestNeighbor(const uint8_t* src, int in_width, int in_height,
                            uint8_t* dst, int out_width, int out_height);
 
+void convertRGB888ToGrayscale(const uint8_t* rgb, uint8_t* gray, int width, int height);

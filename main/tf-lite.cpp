@@ -56,7 +56,7 @@ TfLiteWrapper::TfLiteWrapper(const unsigned char* model_data, size_t arena_size_
     }
 }
 
-bool TfLiteWrapper::runInference(const uint8_t* image_data, int width, int height)
+bool TfLiteWrapper::runInference(const uint8_t* image_data, int width, int height) 
 {
     if (!interpreter) {
         ESP_LOGE(TF_TAG, "Interpreter is null");
@@ -69,21 +69,45 @@ bool TfLiteWrapper::runInference(const uint8_t* image_data, int width, int heigh
         return false;
     }
 
+    // Validate input tensor shape: [1, height, width, 1]
+    if (input->dims->size != 4 ||
+        input->dims->data[0] != 1 ||
+        input->dims->data[1] != height ||
+        input->dims->data[2] != width ||
+        input->dims->data[3] != 1) {
+        ESP_LOGE(TF_TAG, "Unexpected input tensor shape: [%d, %d, %d, %d]",
+                 input->dims->data[0],
+                 input->dims->data[1],
+                 input->dims->data[2],
+                 input->dims->data[3]);
+        return false;
+    }
+
     ESP_LOGI(TF_TAG, "Input tensor type: %d", input->type);
 
-    // Log first few pixels
+    // Log first few input pixels
     ESP_LOGI(TF_TAG, "First 10 input pixels:");
-    for (int i = 0; i < 10 && i < width * height * 3; i++) {
+    for (int i = 0; i < 10 && i < width * height; i++) {
         ESP_LOGI(TF_TAG, "%d: %u", i, image_data[i]);
     }
 
     // Copy image data into input tensor
+    int expected_size = width * height;
     if (input->type == kTfLiteUInt8) {
-        memcpy(input->data.uint8, image_data, width * height * 3);
+        memcpy(input->data.uint8, image_data, expected_size);
     } else if (input->type == kTfLiteFloat32) {
         float* input_f = input->data.f;
-        for (int i = 0; i < width * height * 3; i++) {
+        for (int i = 0; i < expected_size; i++) {
             input_f[i] = image_data[i] / 255.0f;
+        }
+    } else if (input->type == kTfLiteInt8) {
+        // kTfLiteInt8 expects values in the range [-128, 127], so we subtract 128 from each pixel.
+        // This assumes symmetric quantization. If your model uses asymmetric quantization, you should apply:
+        // input_i8[i] = static_cast<int8_t>((image_data[i] - zero_point) / scale);
+        int8_t* input_i8 = input->data.int8;
+        for (int i = 0; i < expected_size; i++) {
+            // Convert [0,255] to [-128,127] using symmetric quantization
+            input_i8[i] = static_cast<int8_t>((image_data[i] - 128));
         }
     } else {
         ESP_LOGE(TF_TAG, "Unsupported input tensor type: %d", input->type);
@@ -97,6 +121,7 @@ bool TfLiteWrapper::runInference(const uint8_t* image_data, int width, int heigh
         return false;
     }
 
+    // Get output tensor
     TfLiteTensor* output = interpreter->output(0);
     if (!output) {
         ESP_LOGE(TF_TAG, "Output tensor is null");
@@ -120,17 +145,33 @@ bool TfLiteWrapper::runInference(const uint8_t* image_data, int width, int heigh
         for (int i = 0; i < num_outputs; i++) {
             ESP_LOGI(TF_TAG, "output[%d] = %u", i, output->data.uint8[i]);
         }
+    } else if (output->type == kTfLiteInt8) {
+        for (int i = 0; i < num_outputs; i++) {
+            int8_t raw = output->data.int8[i];
+            float dequantized = (raw - output->params.zero_point) * output->params.scale;
+            ESP_LOGI(TF_TAG, "output[%d] = %d (dequantized: %f)", i, raw, dequantized);
+        }
     } else {
         ESP_LOGW(TF_TAG, "Unknown output tensor type: %d", output->type);
     }
 
-    // Assuming output is [1, num_classes] float and person is class 1
-    int person_index = 1; // adjust if needed
+    // Assuming person is class index 1
+    int person_index = 1;
+    if (person_index >= num_outputs) {
+        ESP_LOGW(TF_TAG, "Person index out of bounds");
+        return false;
+    }
+
     float confidence = 0.0f;
     if (output->type == kTfLiteFloat32) {
         confidence = output->data.f[person_index];
     } else if (output->type == kTfLiteUInt8) {
         confidence = output->data.uint8[person_index] / 255.0f;
+    } else if (output->type == kTfLiteInt8) {
+        int8_t raw = output->data.int8[person_index];
+        confidence = (raw - output->params.zero_point) * output->params.scale;
+    } else {
+        ESP_LOGW(TF_TAG, "Unsupported output tensor type: %d", output->type);
     }
 
     ESP_LOGI(TF_TAG, "Person confidence: %f", confidence);
