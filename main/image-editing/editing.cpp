@@ -1,6 +1,7 @@
 #include "editing.h"
+#include <cstring>
 
-void resizeNearestNeighbor(const uint8_t* src, int in_width, int in_height,
+void resizeRgbNearestNeighbor(const uint8_t* src, int in_width, int in_height,
                            uint8_t* dst, int out_width, int out_height) {
     for (int y = 0; y < out_height; y++) {
         int src_y = y * in_height / out_height;
@@ -14,12 +15,30 @@ void resizeNearestNeighbor(const uint8_t* src, int in_width, int in_height,
     }
 }
 
-void convertRGB888ToGrayscale(const uint8_t* rgb, uint8_t* gray, int width, int height) {
+void convertRgb888ToGrayscale(const uint8_t* rgb, uint8_t* gray, int width, int height) {
     int pixel_count = width * height;
     for (int i = 0; i < pixel_count; ++i) {
         uint8_t r = rgb[i * 3];
         uint8_t g = rgb[i * 3 + 1];
         uint8_t b = rgb[i * 3 + 2];
         gray[i] = (r * 30 + g * 59 + b * 11) / 100;  // Weighted average
+    }
+}
+
+void cropCenter(uint8_t* src, int src_width, int src_height, 
+                uint8_t* dst, int crop_width, int crop_height, int channels)
+{
+    // Calculate top-left corner of the crop region
+    int start_x = (src_width  - crop_width)  / 2;
+    int start_y = (src_height - crop_height) / 2;
+
+    // Safety clamp
+    if (start_x < 0) start_x = 0;
+    if (start_y < 0) start_y = 0;
+
+    for (int y = 0; y < crop_height; ++y) {
+        const uint8_t* src_row = src + ((start_y + y) * src_width + start_x) * channels;
+        uint8_t* dst_row = dst + (y * crop_width) * channels;
+        memcpy(dst_row, src_row, crop_width * channels);
     }
 }

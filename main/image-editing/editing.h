@@ -6,7 +6,10 @@
 // dst: pointer to output image (out_width x out_height x 3)
 // in_width, in_height: input image dimensions
 // out_width, out_height: output image dimensions
-void resizeNearestNeighbor(const uint8_t* src, int in_width, int in_height,
+void resizeRgbNearestNeighbor(const uint8_t* src, int in_width, int in_height,
                            uint8_t* dst, int out_width, int out_height);
 
-void convertRGB888ToGrayscale(const uint8_t* rgb, uint8_t* gray, int width, int height);
+void convertRgb888ToGrayscale(const uint8_t* rgb, uint8_t* gray, int width, int height);
+
+void cropCenter(uint8_t* src, int src_width, int src_height, 
+                uint8_t* dst, int crop_width, int crop_height, int channels);

@@ -49,8 +49,9 @@ void capture_task(void *arg)
             xSemaphoreGive(frame_mutex);
 
             if (fb->width >= 96 && fb->height >= 96) {
-                resizeNearestNeighbor(fb->buf, fb->width, fb->height, resized_frame, 96, 96);
-
+                int channels = (fb->format == PIXFORMAT_GRAYSCALE) ? 1 : 3;
+                cropCenter(fb->buf, fb->width, fb->height, resized_frame, 96, 96, channels);
+                
                 TfLiteTensor* input = tf_wrapper.getInputTensor();
                 if (input && input->dims && input->dims->size >= 4) {
                     ESP_LOGI(TF_TAG, "Input tensor type: %d", input->type);
@@ -72,7 +73,7 @@ void capture_task(void *arg)
         esp_camera_fb_return(fb);
         ESP_LOGI(CAPTURE_TAG, "Captured frame: %u bytes", (unsigned)latest_frame.size());
 
-        vTaskDelay(pdMS_TO_TICKS(20000)); // 20 second interval
+        vTaskDelay(pdMS_TO_TICKS(10000)); // 20 second interval
     }
 }
 
