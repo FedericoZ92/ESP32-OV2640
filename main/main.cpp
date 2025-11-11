@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <vector>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -15,7 +16,7 @@
 #include "tf-lite.h"
 #include "tflite-person-detect/person_detect_model_data.h"
 #include "image-editing/editing.h"
-#include <vector>
+#include "led/led.h"
 
 //CameraHttpServer server;
 //WifiManager wifi;
@@ -24,6 +25,8 @@
 static std::vector<uint8_t> latest_frame;
 static SemaphoreHandle_t frame_mutex = nullptr;
 static TfLiteWrapper tf_wrapper;
+// leds
+LedController led;
 
 // Background task: capture a new frame every 10 seconds
 void capture_task(void *arg)
@@ -60,6 +63,13 @@ void capture_task(void *arg)
 
                     person_present = tf_wrapper.runInference(resized_frame, 96, 96);
                     ESP_LOGI(TF_TAG, "Person detected? %s", person_present ? "YES" : "NO");
+                    if (person_present){
+                        led.turnLedOff();
+                        led.turnBlueLedOn();
+                    }else{
+                        led.turnLedOff();
+                        led.turnRedLedOn();
+                    }
                 } else {
                     ESP_LOGE(TF_TAG, "Input tensor is null or malformed");
                 }
