@@ -9,5 +9,7 @@ project(ov2640)
 
 set(EXTRA_COMPONENT_DIRS
     managed_components/espressif__esp-tflite-micro
-    components/esp32-camera-f
+    managed_components/espressif__esp_jpeg
+    managed_components/espressif__esp-nn
+    managed_components/espressif__esp32-camera
 )

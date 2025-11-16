@@ -44,7 +44,7 @@ dependencies:
       require: private
       version: '>=5.0'
     source:
-      registry_url: https://components.espressif.com/
+      registry_url: https://components.espressif.com
       type: service
     version: 1.3.1
   idf:
@@ -54,8 +54,7 @@ dependencies:
 direct_dependencies:
 - espressif/esp-tflite-micro
 - espressif/esp32-camera
-- espressif/esp_jpeg
 - idf
-manifest_hash: 712fb0a12a768def5d800babc0b7994c97918384c978b805e409ac0673f27dc6
+manifest_hash: 92ba7f3b8661a05870bd33edc814d3007810f821a8db8ef8d5a980ef1c6276e9
 target: esp32s3
 version: 2.0.0

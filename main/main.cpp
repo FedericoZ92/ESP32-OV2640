@@ -12,7 +12,7 @@
 #include "http-server.h"
 #include "wifi.h"
 #include "debug.h"
-#include "config.h"
+#include "gpio-config.h"
 #include "tf-lite.h"
 #include "tflite-person-detect/person_detect_model_data.h"
 #include "image-editing/editing.h"
