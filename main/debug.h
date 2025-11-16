@@ -1,6 +1,7 @@
 #pragma once
 
 #include "esp_log.h"
+#include <string>
 
 
 #define OV2640_TAG "ov2640"
@@ -9,5 +10,5 @@
 #define RAM_TAG "RAM"
 #define LED_TAG "Led";
 
-void log_RAM_status();
+void log_RAM_status(const std::string& header);
 

@@ -13,15 +13,20 @@ WifiManager::~WifiManager() = default;
 
 esp_err_t WifiManager::init()
 {
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
+    static bool initialized = false;
+    if (initialized) return ESP_OK;
 
+    ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_err_t err = esp_event_loop_create_default();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(err);
+    }
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    initialized = true;
     return ESP_OK;
 }
 
@@ -54,18 +59,23 @@ esp_err_t WifiManager::initAP(const std::string &ssid,
     return ESP_OK;
 }
 
-esp_err_t WifiManager::initSTA(const std::string &ssid,
-                               const std::string &password,
-                               int max_retry)
+esp_err_t WifiManager::initSTA(const std::string &ssid, const std::string &password, int max_retry)
 {
-    esp_netif_create_default_wifi_sta();
+    static bool sta_created = false;
+    if (!sta_created) {
+        esp_netif_create_default_wifi_sta();
+        sta_created = true;
+    }
 
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    // Register event handlers once
+    static bool handlers_registered = false;
+    if (!handlers_registered) {
+        ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &WifiManager::eventHandler, nullptr));
+        ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &WifiManager::eventHandler, nullptr));
+        handlers_registered = true;
+    }
 
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &WifiManager::eventHandler, nullptr));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &WifiManager::eventHandler, nullptr));
-
+    // Set mode & config
     wifi_config_t sta_config = {};
     strncpy((char *)sta_config.sta.ssid, ssid.c_str(), sizeof(sta_config.sta.ssid));
     strncpy((char *)sta_config.sta.password, password.c_str(), sizeof(sta_config.sta.password));
@@ -74,17 +84,14 @@ esp_err_t WifiManager::initSTA(const std::string &ssid,
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(OV2640_TAG, "Connecting to SSID:%s ...", ssid.c_str());
-
+    // Wait for connection
     s_retryCount = 0;
     while (!s_connected && s_retryCount < max_retry) {
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
-    if (s_connected)
-        ESP_LOGI(OV2640_TAG, "Connected to Wi-Fi network");
-    else
-        ESP_LOGW(OV2640_TAG, "Failed to connect after %d retries", s_retryCount);
+    if (s_connected) ESP_LOGI(TAG, "Connected to Wi-Fi");
+    else ESP_LOGW(TAG, "Failed to connect after %d retries", s_retryCount);
 
     return ESP_OK;
 }
