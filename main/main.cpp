@@ -1,19 +1,19 @@
 #include <stdio.h>
 #include <vector>
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/semphr.h"
-#include "esp_system.h"
-#include "esp_log.h"
-#include "esp_chip_info.h"
-#include "esp_flash.h"
-#include "esp_camera.h"
-#include "camera_driver.h"
-#include "http-server.h"
-#include "wifi.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
+#include <esp_system.h>
+#include <esp_log.h>
+#include <esp_chip_info.h>
+#include <esp_flash.h>
+#include <esp_camera.h>
+#include "camera-driver/camera-driver.h"
+#include "http-server/http-server.h"
+#include "wifi/wifi.h"
 #include "debug.h"
 #include "gpio-config.h"
-#include "tf-lite.h"
+#include "tf-lite/tf-lite.h"
 #include "tflite-person-detect/person_detect_model_data.h"
 #include "image-editing/editing.h"
 #include "led/led.h"
@@ -59,7 +59,7 @@ void capture_task(void *arg)
                 if (input && input->dims && input->dims->size >= 4) {
                     ESP_LOGI(TF_TAG, "Input tensor type: %d", input->type);
                     ESP_LOGI(TF_TAG, "Input tensor shape: %d x %d x %d",
-                             input->dims->data[1], input->dims->data[2], input->dims->data[3]);
+                                input->dims->data[1], input->dims->data[2], input->dims->data[3]);
 
                     person_present = tf_wrapper.runInference(resized_frame, 96, 96);
                     ESP_LOGI(TF_TAG, "Person detected? %s", person_present ? "YES" : "NO");

@@ -1,4 +1,4 @@
-#include "http-server.h"
+#include "http-server/http-server.h"
 
 CameraHttpServer::CaptureCallback CameraHttpServer::s_captureCallback = nullptr;
 
