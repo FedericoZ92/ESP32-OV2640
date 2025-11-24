@@ -8,6 +8,7 @@ idf_component_register(
          "image-editing/editing.cpp"
          "debug.cpp"
          "led/led.cpp"
+         "psram/psram.cpp"
 
     INCLUDE_DIRS "."
                  "../managed_components/espressif__esp_jpeg"
@@ -20,7 +21,7 @@ idf_component_register(
              esp_netif
              nvs_flash
              esp-tflite-micro
-             esp32-camera        
+             esp32-camera                  
              
     PRIV_REQUIRES spi_flash
 )

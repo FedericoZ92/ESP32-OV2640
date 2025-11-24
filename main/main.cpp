@@ -16,6 +16,8 @@
 #include "tflite-person-detect/person_detect_model_data.h"
 #include "image-editing/editing.h"
 #include "led/led.h"
+#include "psram/psram.h"
+
 
 CameraHttpServer server;
 WifiManager wifi;
@@ -30,8 +32,20 @@ static TfLiteWrapper tf_wrapper;
 void capture_task(void *arg)
 {
     ESP_LOGI(CAPTURE_TAG, "Camera capture task started");
-
     static uint8_t resized_frame[96 * 96];  // Grayscale input for TFLite
+
+    if (PSRAM::isAvailable()) {
+        ESP_LOGD(MAIN_TAG, "PSRAM available! Size: %d bytes\n", (int)PSRAM::getSize());
+        void* ptr = PSRAM::malloc(1024);  // allocate 1 KB in PSRAM
+        if (ptr) {
+             ESP_LOGD(MAIN_TAG, "Allocated 1 KB in PSRAM.\n");
+            PSRAM::free(ptr);
+        } else {
+            ESP_LOGD(MAIN_TAG, "Failed to allocate memory in PSRAM.\n");
+        }
+    } else {
+         ESP_LOGD(MAIN_TAG, "PSRAM NOT available.\n");
+    }
 
     while (true) {
         camera_fb_t *fb = esp_camera_fb_get();
