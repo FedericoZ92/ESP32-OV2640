@@ -18,13 +18,15 @@
 #include "led/led.h"
 #include "psram/psram.h"
 
+#define WIFI_NETWORK "FedericoGA35" // 
+#define WIFI_PASSWORD "chapischapis" // 
 
 CameraHttpServer server;
 WifiManager wifi;
 LedController led;
 
 // --- Shared static frame buffer ---
-static uint8_t latest_frame[160 * 120]; // QQVGA grayscale
+uint8_t *latest_frame = NULL;
 static SemaphoreHandle_t frame_mutex = nullptr;
 static TfLiteWrapper tf_wrapper;
 
@@ -45,6 +47,13 @@ void capture_task(void *arg)
         }
     } else {
          ESP_LOGD(MAIN_TAG, "PSRAM NOT available.\n");
+         return;
+    }
+
+    latest_frame = (uint8_t*) heap_caps_malloc(160 * 120, MALLOC_CAP_SPIRAM);
+    if (!latest_frame) {
+        printf("Failed to allocate PSRAM buffer!\n");
+        return;
     }
 
     while (true) {
@@ -147,11 +156,10 @@ extern "C" void app_main(void)
 
     // --- Allocate TensorFlow Lite arena intelligently ---
     uint8_t* tensor_arena = nullptr;
-    const size_t arena_size = 64 * 1024; // 64 KB for person detect model
-
+    const size_t arena_size = 128 * 1024; 
     if (!tensor_arena) {
-        tensor_arena = (uint8_t*)heap_caps_malloc(arena_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        ESP_LOGI(TF_TAG, "Allocating tensor arena in internal RAM (%d bytes)", (int)arena_size);
+        ESP_LOGW(TF_TAG, "Internal RAM low, allocating arena in PSRAM");
+        tensor_arena = (uint8_t*) heap_caps_malloc(arena_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     }
     if (!tensor_arena) {
         ESP_LOGE(TF_TAG, "Failed to allocate tensor arena!");
@@ -165,7 +173,7 @@ extern "C" void app_main(void)
 
     // --- Wi-Fi initialization ---
     wifi.init();
-    wifi.initSTA("FedericoGA35", "chapischapis"); // connect to your network
+    wifi.initSTA(WIFI_NETWORK, WIFI_PASSWORD); // connect to your network
 
     // --- Camera initialization ---
     CameraDriver camera;
@@ -199,7 +207,7 @@ extern "C" void app_main(void)
     }
 
     // --- Start capture task ---
-    xTaskCreate(capture_task, "capture_task", 16384, nullptr, 5, nullptr);
+    xTaskCreate(capture_task, "capture_task", 4096, nullptr, 5, nullptr);
     ESP_LOGI(OV2640_TAG, "Started periodic capture task");
 
     // --- Optional: run for a limited time, then reboot ---
