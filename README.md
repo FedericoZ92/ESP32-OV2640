@@ -1,53 +1,66 @@
-| Supported Targets | ESP32 | ESP32-C2 | ESP32-C3 | ESP32-C5 | ESP32-C6 | ESP32-C61 | ESP32-H2 | ESP32-P4 | ESP32-S2 | ESP32-S3 | Linux |
-| ----------------- | ----- | -------- | -------- | -------- | -------- | --------- | -------- | -------- | -------- | -------- | ----- |
+# ESP32 Person Detection Camera
 
-# Hello World Example
+This project implements a **real-time person detection camera** on an ESP32 board with PSRAM support. It captures images from an OV2640 camera, runs **TensorFlow Lite Micro** inference to detect the presence of a person, and serves the latest captured frame over an HTTP server. LEDs indicate detection status, and the system is designed for low-memory embedded environments.
 
-Starts a FreeRTOS task to print "Hello World".
+---
 
-(See the README.md file in the upper level 'examples' directory for more information about examples.)
+## Features
 
-## How to use example
+- **Camera capture**: Periodically captures frames from an OV2640 camera module.
+- **Person detection**: Uses a TensorFlow Lite Micro model to detect whether a person is present in the frame.
+- **LED indicators**:
+  - **Blue LED** – person detected
+  - **Red LED** – no person detected
+- **HTTP streaming**: Serve the latest captured frame at `/capture.jpg`.
+- **PSRAM-aware memory allocation**: Uses external PSRAM for frame buffers and TensorFlow Lite arena when available.
+- **Wi-Fi connectivity**: Connects to a specified Wi-Fi network and exposes a local HTTP server.
+- **Automatic reboot**: Optional runtime limit to restart the device for reliability.
 
-Follow detailed instructions provided specifically for this example.
+---
 
-Select the instructions depending on Espressif chip installed on your development board:
+## Hardware Requirements
 
-- [ESP32 Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/stable/get-started/index.html)
-- [ESP32-S2 Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s2/get-started/index.html)
+- ESP32 board with PSRAM support (e.g., ESP32-WROVER)
+- OV2640 camera module
+- RGB LEDs or separate blue/red LEDs for detection indicators
 
+---
 
-## Example folder contents
+## Software Components
 
-The project **hello_world** contains one source file in C language [hello_world_main.c](main/hello_world_main.c). The file is located in folder [main](main).
+- **FreeRTOS**: Task scheduling and concurrency
+- **ESP-IDF**: ESP32 SDK for hardware access
+- **ESP32 Camera Driver**: Capture frames from OV2640
+- **TensorFlow Lite Micro**: Lightweight ML inference on microcontrollers
+- **HTTP Server**: Serve captured frames to web clients
 
-ESP-IDF projects are built using CMake. The project build configuration is contained in `CMakeLists.txt` files that provide set of directives and instructions describing the project's source files and targets (executable, library, or both).
+**Custom Libraries**:
 
-Below is short explanation of remaining files in the project folder.
+- `camera-driver` – camera initialization and capture
+- `wifi` – Wi-Fi management
+- `led` – LED control
+- `psram` – external memory management
+- `image-editing` – frame resizing and cropping
 
-```
-├── CMakeLists.txt
-├── pytest_hello_world.py      Python script used for automated testing
-├── main
-│   ├── CMakeLists.txt
-│   └── hello_world_main.c
-└── README.md                  This is the file you are currently reading
-```
+---
 
-For more information on structure and contents of ESP-IDF projects, please refer to Section [Build System](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/build-system.html) of the ESP-IDF Programming Guide.
+## How It Works
 
-## Troubleshooting
+### Initialization
 
-* Program upload failure
+1. PSRAM and internal memory checked and allocated.
+2. TensorFlow Lite Micro arena initialized.
+3. Wi-Fi and HTTP server started.
+4. Camera initialized and flipped 180° if needed.
 
-    * Hardware connection is not correct: run `idf.py -p PORT monitor`, and reboot your board to see if there are any output logs.
-    * The baud rate for downloading is too high: lower your baud rate in the `menuconfig` menu, and try again.
+### Capture Task
 
-## Technical support and feedback
+- Runs periodically (every 10 seconds by default).
+- Captures a frame from the camera.
+- Resizes to 96×96 grayscale for TFLite inference.
+- Runs person detection model.
+- Updates LED indicators based on detection result.
 
-Please use the following feedback channels:
+### HTTP Server
 
-* For technical queries, go to the [esp32.com](https://esp32.com/) forum
-* For a feature request or bug report, create a [GitHub issue](https://github.com/espressif/esp-idf/issues)
-
-We will get back to you as soon as possible.
+- Latest frame is served at `/capture.jpg`.
