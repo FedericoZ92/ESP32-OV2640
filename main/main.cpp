@@ -36,6 +36,7 @@ uint8_t* tflite_input_buffer = nullptr; // default: raw buffer
 void capture_task(void *arg)
 {
     ESP_LOGI(CAPTURE_TAG, "Camera capture task started");
+    static uint8_t resized_frame[96 * 96];  // Grayscale input for TFLite
 
     if (!PSRAM::isAvailable()) {
         ESP_LOGD(MAIN_TAG, "PSRAM NOT available.\n");
@@ -66,8 +67,8 @@ void capture_task(void *arg)
             decoded_buffer = nullptr;
         }
 
+        // Handle JPEG decoding or raw frame
         if (fb->format == PIXFORMAT_JPEG) {
-            // Allocate decoded buffer for RGB565
             decoded_buffer = (uint8_t*) heap_caps_malloc(fb->width * fb->height * 2, MALLOC_CAP_SPIRAM);
             if (!decoded_buffer) {
                 ESP_LOGE(CAPTURE_TAG, "Failed to allocate decoded buffer for JPEG");
@@ -95,7 +96,6 @@ void capture_task(void *arg)
 
             tflite_input_buffer = decoded_buffer;
         } else if (fb->format == PIXFORMAT_GRAYSCALE || fb->format == PIXFORMAT_RGB565) {
-            // Already raw pixels — no decoding needed
             tflite_input_buffer = fb->buf;
         } else {
             ESP_LOGW(CAPTURE_TAG, "Unsupported pixel format %d", fb->format);
@@ -104,7 +104,42 @@ void capture_task(void *arg)
             continue;
         }
 
-        // Copy JPEG frame for HTTP server if needed
+        // --- TensorFlow Lite inference ---
+        if (fb->width >= 96 && fb->height >= 96) {
+            int channels = (fb->format == PIXFORMAT_RGB565 || fb->format == PIXFORMAT_RGB888) ? 3 : 1;
+
+            // Crop and resize to 96x96
+            cropCenter(tflite_input_buffer, fb->width, fb->height, resized_frame, 96, 96, channels);
+
+            // Convert to grayscale if needed
+            static uint8_t gray_frame[96 * 96];
+            if (channels == 3) {
+                convertRgb888ToGrayscale(resized_frame, gray_frame, 96, 96);
+            } else {
+                memcpy(gray_frame, resized_frame, 96 * 96);
+            }
+
+            // Run inference
+            TfLiteTensor* input = tf_wrapper.getInputTensor();
+            if (input && input->dims && input->dims->size >= 4) {
+                bool person_present = tf_wrapper.runInference(gray_frame, 96, 96);
+                ESP_LOGI(TF_TAG, "Person detected? %s", person_present ? "YES" : "NO");
+
+                if (person_present) {
+                    led.turnLedOff();
+                    led.turnBlueLedOn();
+                } else {
+                    led.turnLedOff();
+                    led.turnRedLedOn();
+                }
+            } else {
+                ESP_LOGE(TF_TAG, "Input tensor is null or malformed");
+            }
+        } else {
+            ESP_LOGW(CAPTURE_TAG, "Frame too small to resize to 96x96");
+        }
+
+        // --- Copy JPEG frame for HTTP server ---
         if (fb->format == PIXFORMAT_JPEG) {
             if (xSemaphoreTake(frame_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
                 if (fb->len <= jpeg_buf_size) {
@@ -119,8 +154,8 @@ void capture_task(void *arg)
             }
         }
 
-        esp_camera_fb_return(fb); // Return the camera framebuffer
-        vTaskDelay(pdMS_TO_TICKS(10000)); // Wait 10 seconds before next capture
+        esp_camera_fb_return(fb);
+        vTaskDelay(pdMS_TO_TICKS(10000));
     }
 }
 
