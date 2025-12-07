@@ -17,9 +17,7 @@
 #include "image-editing/editing.h"
 #include "led/led.h"
 #include "psram/psram.h"
-
-#define WIFI_NETWORK "FedericoGA35" // 
-#define WIFI_PASSWORD "chapischapis" // 
+#include "network.h"
 
 CameraHttpServer server;
 WifiManager wifi;

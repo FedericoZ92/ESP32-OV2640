@@ -22,3 +22,4 @@ sdkconfig
 ./builds/
 builds/
 /builds*/
+**/network.h
