@@ -56,7 +56,7 @@ void CameraDriver::configureCamera() {
     config.xclk_freq_hz = 10000000; //was 20000000
     config.pixel_format = PIXFORMAT_JPEG; //PIXFORMAT_GRAYSCALE; 
     config.frame_size = FRAMESIZE_QQVGA; //FRAMESIZE_QVGA;
-    config.jpeg_quality = 15;
+    config.jpeg_quality = 12;
     config.fb_count = 1;
     config.fb_location = CAMERA_FB_IN_PSRAM; //Store in internal RAM
     config.grab_mode = CAMERA_GRAB_LATEST;
