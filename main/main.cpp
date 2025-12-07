@@ -27,32 +27,26 @@ LedController led;
 uint8_t *latest_frame = NULL;
 static SemaphoreHandle_t frame_mutex = nullptr;
 static TfLiteWrapper tf_wrapper;
+static size_t latest_frame_len = 0; // store size of latest JPEG frame
 
 // Background task: capture a new frame every 10 seconds
 void capture_task(void *arg)
 {
     ESP_LOGI(CAPTURE_TAG, "Camera capture task started");
     static uint8_t resized_frame[96 * 96];  // Grayscale input for TFLite
-
-    if (PSRAM::isAvailable()) {
-        ESP_LOGD(MAIN_TAG, "PSRAM available! Size: %d bytes\n", (int)PSRAM::getSize());
-        void* ptr = PSRAM::malloc(1024);  // allocate 1 KB in PSRAM
-        if (ptr) {
-             ESP_LOGD(MAIN_TAG, "Allocated 1 KB in PSRAM.\n");
-            PSRAM::free(ptr);
-        } else {
-            ESP_LOGD(MAIN_TAG, "Failed to allocate memory in PSRAM.\n");
-        }
-    } else {
-         ESP_LOGD(MAIN_TAG, "PSRAM NOT available.\n");
-         return;
-    }
-
-    latest_frame = (uint8_t*) heap_caps_malloc(160 * 120, MALLOC_CAP_SPIRAM);
-    if (!latest_frame) {
-        printf("Failed to allocate PSRAM buffer!\n");
+    if (!PSRAM::isAvailable()) {
+        ESP_LOGD(MAIN_TAG, "PSRAM NOT available.\n");
         return;
     }
+
+    // Allocate JPEG buffer (QQVGA worst-case ~16 KB)
+    const size_t jpeg_buf_size = 20 * 1024; 
+    latest_frame = (uint8_t*) heap_caps_malloc(jpeg_buf_size, MALLOC_CAP_SPIRAM);
+    if (!latest_frame) {
+        ESP_LOGE(CAPTURE_TAG, "Failed to allocate PSRAM buffer for JPEG frames!");
+        return;
+    }
+    latest_frame_len = 0;
 
     while (true) {
         camera_fb_t *fb = esp_camera_fb_get();
@@ -62,48 +56,63 @@ void capture_task(void *arg)
             continue;
         }
 
-        ESP_LOGI(CAPTURE_TAG, "Frame: %dx%d, len=%d, format=%d",
-                 fb->width, fb->height, fb->len, fb->format);
-
+        ESP_LOGI(CAPTURE_TAG, "Frame: %dx%d, len=%d, format=%d", fb->width, fb->height, fb->len, fb->format);
         bool person_present = false;
+        // --- TensorFlow Lite inference ---
+        if (fb->width >= 96 && fb->height >= 96) {
+            // Determine number of channels
+            int channels = (fb->format == PIXFORMAT_GRAYSCALE) ? 1 : 3;
 
-        if (xSemaphoreTake(frame_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-            // Copy only grayscale QQVGA frames
-            size_t copy_len = fb->len;
-            if (copy_len > sizeof(latest_frame)) copy_len = sizeof(latest_frame);
-            memcpy(latest_frame, fb->buf, copy_len);
-            xSemaphoreGive(frame_mutex);
+            // Crop and resize to 96x96 for TFLite
+            cropCenter(fb->buf, fb->width, fb->height, resized_frame, 96, 96, channels);
 
-            // Resize to 96x96 for TFLite
-            if (fb->width >= 96 && fb->height >= 96) {
-                int channels = (fb->format == PIXFORMAT_GRAYSCALE) ? 1 : 3;
-                cropCenter(fb->buf, fb->width, fb->height, resized_frame, 96, 96, channels);
+            // Convert to grayscale if needed
+            /*static uint8_t gray_frame[96 * 96];
+            if (channels == 3) { // RGB888 -> grayscale
+                convertRgb888ToGrayscale(resized_frame, gray_frame, 96, 96);
+            } else {
+                memcpy(gray_frame, resized_frame, 96 * 96);
+            }*/
 
-                TfLiteTensor* input = tf_wrapper.getInputTensor();
-                if (input && input->dims && input->dims->size >= 4) {
-                    person_present = tf_wrapper.runInference(resized_frame, 96, 96);
-                    ESP_LOGI(TF_TAG, "Person detected? %s", person_present ? "YES" : "NO");
+            // Run inference
+            /*TfLiteTensor* input = tf_wrapper.getInputTensor();
+            if (input && input->dims && input->dims->size >= 4) {
+                person_present = tf_wrapper.runInference(gray_frame, 96, 96);
+                ESP_LOGI(TF_TAG, "Person detected? %s", person_present ? "YES" : "NO");
 
-                    if (person_present) {
-                        led.turnLedOff();
-                        led.turnBlueLedOn();
-                    } else {
-                        led.turnLedOff();
-                        led.turnRedLedOn();
-                    }
+                if (person_present) {
+                    led.turnLedOff();
+                    led.turnBlueLedOn();
                 } else {
-                    ESP_LOGE(TF_TAG, "Input tensor is null or malformed");
+                    led.turnLedOff();
+                    led.turnRedLedOn();
                 }
             } else {
-                ESP_LOGW(CAPTURE_TAG, "Frame too small to resize to 96x96");
-            }
+                ESP_LOGE(TF_TAG, "Input tensor is null or malformed");
+            }*/
         } else {
-            ESP_LOGW(CAPTURE_TAG, "Failed to acquire frame mutex");
+            ESP_LOGW(CAPTURE_TAG, "Frame too small to resize to 96x96");
         }
 
-        esp_camera_fb_return(fb);
+        // --- Copy JPEG frame for HTTP server ---
+        if (fb->format == PIXFORMAT_JPEG) {
+            if (xSemaphoreTake(frame_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+                if (fb->len <= jpeg_buf_size) {
+                    memcpy(latest_frame, fb->buf, fb->len);
+                    latest_frame_len = fb->len;
+                } else {
+                    ESP_LOGW(CAPTURE_TAG, "JPEG frame too large for buffer! len=%d", fb->len);
+                }
+                xSemaphoreGive(frame_mutex);
+            } else {
+                ESP_LOGW(CAPTURE_TAG, "Failed to acquire frame mutex for HTTP frame");
+            }
+        } else {
+            ESP_LOGW(CAPTURE_TAG, "Frame is not JPEG format, skipping HTTP copy");
+        }
 
-        vTaskDelay(pdMS_TO_TICKS(10000)); // 10-second interval
+        esp_camera_fb_return(fb); // Return the camera framebuffer
+        vTaskDelay(pdMS_TO_TICKS(10000)); // Wait 10 seconds before next capture
     }
 }
 
@@ -114,12 +123,10 @@ esp_err_t capture_http_handler(httpd_req_t *req)
         httpd_resp_send_500(req);
         return ESP_FAIL;
     }
-
     httpd_resp_set_type(req, "image/jpeg");
     esp_err_t res = httpd_resp_send(req,
                                     reinterpret_cast<const char *>(latest_frame),
-                                    sizeof(latest_frame));
-
+                                    latest_frame_len); // use actual frame size
     xSemaphoreGive(frame_mutex);
     return res;
 }
