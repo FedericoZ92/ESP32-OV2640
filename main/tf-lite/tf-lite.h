@@ -11,6 +11,7 @@
 #include <cstdint>
 #include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
 
+#define TF_IMAGE_INPUT_SIZE 96
 
 class TfLiteWrapper {
 public:

@@ -17,12 +17,19 @@
 #include "image-editing/editing.h"
 #include "led/led.h"
 #include "psram/psram.h"
-//#include "esp_jpeg/esp_jpeg.h" // ESP-IDF JPEG decode API
 #include "network.h"
+
+// OV2640 pin map for ESP32-S3-CAM-N16R8
+// https://www.oceanlabz.in/getting-started-with-esp32-s3-wroom-n16r8-cam-dev-board/?srsltid=AfmBOors-1xeo_-CM5mcneEFHgQY9ps0qX2SHt8gf-S7Ndizot0T4vzk
+// in docs: schematics file from: https://www.homotix.it/vendita/moduli-wi-fi/scheda-esp32-s3-n16r8
+// https://github.com/microrobotics/ESP32-S3-N16R8/blob/main/ESP32-S3-N16R8_User_Guide.pdf
+
+#define JPEG_BUFFER_SIZE 20 * 1024 // FRAMESIZE_QQVGA: 160x120
+#define ARENA_SIZE 128 * 1024;
 
 CameraHttpServer server;
 WifiManager wifi;
-LedController led;
+LedController led = LedController(GPIO_NUM_38);
 
 // --- Shared static frame buffer ---
 uint8_t *latest_frame = NULL;
@@ -31,19 +38,20 @@ static TfLiteWrapper tf_wrapper;
 static size_t latest_frame_len = 0; // store size of latest JPEG frame
 uint8_t *decoded_buffer = nullptr; // raw pixels
 uint8_t* tflite_input_buffer = nullptr; // default: raw buffer
+static uint8_t gray_frame[TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE];
 
 // Background task: capture a new frame every 10 seconds
 void capture_task(void *arg)
 {
     ESP_LOGI(CAPTURE_TAG, "Camera capture task started");
-    static uint8_t resized_frame[96 * 96];  // Grayscale input for TFLite
+    static uint8_t resized_frame[TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE];  // Grayscale input for TFLite
 
     if (!PSRAM::isAvailable()) {
         ESP_LOGD(MAIN_TAG, "PSRAM NOT available.\n");
         return;
     }
 
-    const size_t jpeg_buf_size = 20 * 1024; 
+    const size_t jpeg_buf_size = JPEG_BUFFER_SIZE;
     latest_frame = (uint8_t*) heap_caps_malloc(jpeg_buf_size, MALLOC_CAP_SPIRAM);
     if (!latest_frame) {
         ESP_LOGE(CAPTURE_TAG, "Failed to allocate PSRAM buffer for JPEG frames!");
@@ -69,29 +77,14 @@ void capture_task(void *arg)
 
         // Handle JPEG decoding or raw frame
         if (fb->format == PIXFORMAT_JPEG) {
-            decoded_buffer = (uint8_t*) heap_caps_malloc(fb->width * fb->height * 2, MALLOC_CAP_SPIRAM);
+            decoded_buffer = allocating_decode_camera_jpeg(fb, 
+                                                            MALLOC_CAP_SPIRAM, 
+                                                            JPEG_IMAGE_FORMAT_RGB565,
+                                                            JPEG_IMAGE_SCALE_0);
             if (!decoded_buffer) {
-                ESP_LOGE(CAPTURE_TAG, "Failed to allocate decoded buffer for JPEG");
+                ESP_LOGE(CAPTURE_TAG, "JPEG decode failed");
                 esp_camera_fb_return(fb);
-                vTaskDelete(NULL);
-            }
-
-            esp_jpeg_image_cfg_t cfg = {};
-            cfg.indata = fb->buf;
-            cfg.indata_size = fb->len;
-            cfg.outbuf = decoded_buffer;
-            cfg.outbuf_size = fb->width * fb->height * 2;
-            cfg.out_format = JPEG_IMAGE_FORMAT_RGB565;
-            cfg.out_scale = JPEG_IMAGE_SCALE_0;
-
-            esp_jpeg_image_output_t output_info = {};
-            esp_err_t err = esp_jpeg_decode(&cfg, &output_info);
-            if (err != ESP_OK) {
-                ESP_LOGE(CAPTURE_TAG, "Failed to decode JPEG: %d", err);
-                heap_caps_free(decoded_buffer);
-                decoded_buffer = nullptr;
-                esp_camera_fb_return(fb);
-                vTaskDelete(NULL);
+                continue;
             }
 
             tflite_input_buffer = decoded_buffer;
@@ -105,30 +98,30 @@ void capture_task(void *arg)
         }
 
         // --- TensorFlow Lite inference ---
-        if (fb->width >= 96 && fb->height >= 96) {
+        if (fb->width >= TF_IMAGE_INPUT_SIZE && fb->height >= TF_IMAGE_INPUT_SIZE) {
             int channels = (fb->format == PIXFORMAT_RGB565 || fb->format == PIXFORMAT_RGB888) ? 3 : 1;
 
             // Crop and resize to 96x96
-            cropCenter(tflite_input_buffer, fb->width, fb->height, resized_frame, 96, 96, channels);
+            cropCenter(tflite_input_buffer, fb->width, fb->height, resized_frame, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE, channels);
 
             // Convert to grayscale if needed
-            static uint8_t gray_frame[96 * 96];
             if (channels == 3) {
-                convertRgb888ToGrayscale(resized_frame, gray_frame, 96, 96);
+                convertRgb888ToGrayscale(resized_frame, gray_frame, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE);
             } else {
-                memcpy(gray_frame, resized_frame, 96 * 96);
+                memcpy(gray_frame, resized_frame, TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE);
             }
 
             // Run inference
             TfLiteTensor* input = tf_wrapper.getInputTensor();
             if (input && input->dims && input->dims->size >= 4) {
-                bool person_present = tf_wrapper.runInference(gray_frame, 96, 96);
+                bool person_present = tf_wrapper.runInference(gray_frame, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE);
                 ESP_LOGI(TF_TAG, "Person detected? %s", person_present ? "YES" : "NO");
 
                 if (person_present) {
                     led.turnLedOff();
                     led.turnBlueLedOn();
                 } else {
+                    led.setLedGpio2(1);
                     led.turnLedOff();
                     led.turnRedLedOn();
                 }
@@ -204,7 +197,7 @@ extern "C" void app_main(void)
 
     // --- Allocate TensorFlow Lite arena intelligently ---
     uint8_t* tensor_arena = nullptr;
-    const size_t arena_size = 128 * 1024; 
+    const size_t arena_size = ARENA_SIZE; 
     if (!tensor_arena) {
         ESP_LOGW(TF_TAG, "Internal RAM low, allocating arena in PSRAM");
         tensor_arena = (uint8_t*) heap_caps_malloc(arena_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);

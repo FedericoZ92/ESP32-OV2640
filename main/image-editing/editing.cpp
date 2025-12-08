@@ -1,5 +1,9 @@
 #include "editing.h"
 #include <cstring>
+// jpeg
+//#include "esp_jpeg.h" //"esp_jpeg_decoder.h"   // or <esp_jpeg.h> depending on your SDK
+#include "esp_heap_caps.h"
+#include "esp_log.h"
 
 void resizeRgbNearestNeighbor(const uint8_t* src, int in_width, int in_height,
                            uint8_t* dst, int out_width, int out_height) {
@@ -41,4 +45,39 @@ void cropCenter(uint8_t* src, int src_width, int src_height,
         uint8_t* dst_row = dst + (y * crop_width) * channels;
         memcpy(dst_row, src_row, crop_width * channels);
     }
+}
+
+uint8_t* allocating_decode_camera_jpeg(camera_fb_t *fb, 
+                                            uint32_t memory_type,
+                                            esp_jpeg_image_format_t out_format,
+                                            esp_jpeg_image_scale_t scale)
+{
+    if (!fb || fb->format != PIXFORMAT_JPEG) return NULL;
+
+    int width  = fb->width;
+    int height = fb->height;
+    size_t out_size = width * height * 2;  // RGB565
+
+    uint8_t* out_buf = (uint8_t*) heap_caps_malloc(out_size, memory_type );
+    if (!out_buf) {
+        ESP_LOGE("JPEG_CONVERT", "Malloc failed");
+        return NULL;
+    }
+
+    esp_jpeg_image_cfg_t cfg = {};
+    cfg.indata       = fb->buf;
+    cfg.indata_size  = fb->len;
+    cfg.outbuf       = out_buf;
+    cfg.outbuf_size  = out_size;
+    cfg.out_format   = out_format;
+    cfg.out_scale    = scale;
+
+    esp_jpeg_image_output_t out = {};
+
+    if (esp_jpeg_decode(&cfg, &out) != ESP_OK) {
+        heap_caps_free(out_buf);
+        return NULL;
+    }
+
+    return out_buf;   // caller frees
 }
