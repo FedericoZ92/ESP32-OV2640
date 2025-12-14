@@ -25,7 +25,7 @@ void cropCenter(uint8_t* src,
                 int crop_height, 
                 int channels);
 
-uint8_t* allocating_decode_camera_jpeg(camera_fb_t *fb, 
-                                        uint32_t memory_type,
-                                        esp_jpeg_image_format_t out_format,
-                                        esp_jpeg_image_scale_t scale);
+uint8_t* allocatingDecodeCameraJpeg(camera_fb_t *fb, 
+                                    uint32_t memory_type,
+                                    esp_jpeg_image_format_t out_format,
+                                    esp_jpeg_image_scale_t scale);

@@ -67,7 +67,7 @@ std::vector<rmt_item32_t> LedController::encodeWS2812(uint8_t red, uint8_t green
     return items;
 }
 
-void configureLedGpio2()
+void LedController::configureLedGpio2()
 {
     gpio_config_t io_conf;
     io_conf.intr_type = GPIO_INTR_DISABLE;
@@ -78,7 +78,7 @@ void configureLedGpio2()
     gpio_config(&io_conf); 
 }
 
-void setLedGpio2(bool value)
+void LedController::setLedGpio2(bool value)
 {
     gpio_set_level(GPIO_NUM_2, (uint32_t)value);   
 }

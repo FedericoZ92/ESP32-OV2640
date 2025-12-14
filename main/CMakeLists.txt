@@ -9,6 +9,7 @@ idf_component_register(
          "debug.cpp"
          "led/led.cpp"
          "psram/psram.cpp"
+         "checkpoint-timer/checkpoint-timer.cpp"
 
     INCLUDE_DIRS "."
                  "../managed_components/espressif__esp_jpeg"
@@ -21,7 +22,8 @@ idf_component_register(
              esp_netif
              nvs_flash
              esp-tflite-micro
-             esp32-camera                  
+             esp32-camera 
+             esp_timer                   
              
     PRIV_REQUIRES spi_flash
 )

@@ -18,6 +18,7 @@
 #include "led/led.h"
 #include "psram/psram.h"
 #include "network.h"
+#include "checkpoint-timer/checkpoint-timer.h"
 
 // OV2640 pin map for ESP32-S3-CAM-N16R8
 // https://www.oceanlabz.in/getting-started-with-esp32-s3-wroom-n16r8-cam-dev-board/?srsltid=AfmBOors-1xeo_-CM5mcneEFHgQY9ps0qX2SHt8gf-S7Ndizot0T4vzk
@@ -30,13 +31,17 @@
 CameraHttpServer server;
 WifiManager wifi;
 LedController led = LedController(GPIO_NUM_38);
+CheckpointTimer jpegTimer;
+CheckpointTimer cameraAcquisitionTimer;
+CheckpointTimer tensorFlowTimer;
+CheckpointTimer httpTimer;
 
 // --- Shared static frame buffer ---
-uint8_t *latest_frame = NULL;
+static uint8_t *latestFrameForHttpUploading = NULL;
 static SemaphoreHandle_t frame_mutex = nullptr;
 static TfLiteWrapper tf_wrapper;
-static size_t latest_frame_len = 0; // store size of latest JPEG frame
-uint8_t *decoded_buffer = nullptr; // raw pixels
+static size_t latestFrameForHttpUploading_len = 0; // store size of latest JPEG frame
+uint8_t *rawImageBuffer = nullptr; // raw pixels
 uint8_t* tflite_input_buffer = nullptr; // default: raw buffer
 static uint8_t gray_frame[TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE];
 
@@ -45,78 +50,73 @@ void capture_task(void *arg)
 {
     ESP_LOGI(CAPTURE_TAG, "Camera capture task started");
     static uint8_t resized_frame[TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE];  // Grayscale input for TFLite
-
-    if (!PSRAM::isAvailable()) {
-        ESP_LOGD(MAIN_TAG, "PSRAM NOT available.\n");
-        return;
-    }
-
     const size_t jpeg_buf_size = JPEG_BUFFER_SIZE;
-    latest_frame = (uint8_t*) heap_caps_malloc(jpeg_buf_size, MALLOC_CAP_SPIRAM);
-    if (!latest_frame) {
+    latestFrameForHttpUploading = (uint8_t*) heap_caps_malloc(jpeg_buf_size, MALLOC_CAP_SPIRAM);
+    if (!latestFrameForHttpUploading) {
         ESP_LOGE(CAPTURE_TAG, "Failed to allocate PSRAM buffer for JPEG frames!");
         return;
     }
-    latest_frame_len = 0;
+    latestFrameForHttpUploading_len = 0;
 
     while (true) {
-        camera_fb_t *fb = esp_camera_fb_get();
-        if (!fb) {
+        // --- Handle JPEG decoding or raw frame ---
+        cameraAcquisitionTimer.checkpoint();
+        camera_fb_t *frameBuffer = esp_camera_fb_get();
+        if (!frameBuffer) {
             ESP_LOGW(CAPTURE_TAG, "Failed to get frame buffer");
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
+        ESP_LOGI(CAPTURE_TAG, "Frame: %dx%d, len=%d, format=%d", frameBuffer->width, frameBuffer->height, frameBuffer->len, frameBuffer->format);
+        cameraAcquisitionTimer.checkpoint(CAPTURE_TAG, "frame captured");
+        // ---
 
-        ESP_LOGI(CAPTURE_TAG, "Frame: %dx%d, len=%d, format=%d", fb->width, fb->height, fb->len, fb->format);
-
+        // --- Handle JPEG decoding to raw frame ---
+        jpegTimer.checkpoint();
         // Free previous decoded buffer
-        if (decoded_buffer) {
-            heap_caps_free(decoded_buffer);
-            decoded_buffer = nullptr;
+        if (rawImageBuffer) {
+            heap_caps_free(rawImageBuffer);
+            rawImageBuffer = nullptr;
         }
-
-        // Handle JPEG decoding or raw frame
-        if (fb->format == PIXFORMAT_JPEG) {
-            decoded_buffer = allocating_decode_camera_jpeg(fb, 
-                                                            MALLOC_CAP_SPIRAM, 
-                                                            JPEG_IMAGE_FORMAT_RGB565,
-                                                            JPEG_IMAGE_SCALE_0);
-            if (!decoded_buffer) {
+        if (frameBuffer->format == PIXFORMAT_JPEG) {
+            rawImageBuffer = allocatingDecodeCameraJpeg(frameBuffer, 
+                                                        MALLOC_CAP_SPIRAM, 
+                                                        JPEG_IMAGE_FORMAT_RGB565,
+                                                        JPEG_IMAGE_SCALE_0);
+            if (!rawImageBuffer) {
                 ESP_LOGE(CAPTURE_TAG, "JPEG decode failed");
-                esp_camera_fb_return(fb);
+                esp_camera_fb_return(frameBuffer);
                 continue;
             }
-
-            tflite_input_buffer = decoded_buffer;
-        } else if (fb->format == PIXFORMAT_GRAYSCALE || fb->format == PIXFORMAT_RGB565) {
-            tflite_input_buffer = fb->buf;
+            tflite_input_buffer = rawImageBuffer;
+        } else if (frameBuffer->format == PIXFORMAT_GRAYSCALE || frameBuffer->format == PIXFORMAT_RGB565) {
+            tflite_input_buffer = frameBuffer->buf;
         } else {
-            ESP_LOGW(CAPTURE_TAG, "Unsupported pixel format %d", fb->format);
-            esp_camera_fb_return(fb);
+            ESP_LOGW(CAPTURE_TAG, "Unsupported pixel format %d", frameBuffer->format);
+            esp_camera_fb_return(frameBuffer);
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
+        jpegTimer.checkpoint(JPEG_TAG, "raw to jpeg conversion done");
+        // ---
 
         // --- TensorFlow Lite inference ---
-        if (fb->width >= TF_IMAGE_INPUT_SIZE && fb->height >= TF_IMAGE_INPUT_SIZE) {
-            int channels = (fb->format == PIXFORMAT_RGB565 || fb->format == PIXFORMAT_RGB888) ? 3 : 1;
-
+        tensorFlowTimer.checkpoint();
+        if (frameBuffer->width >= TF_IMAGE_INPUT_SIZE && frameBuffer->height >= TF_IMAGE_INPUT_SIZE) {
+            int channels = (frameBuffer->format == PIXFORMAT_RGB565 || frameBuffer->format == PIXFORMAT_RGB888) ? 3 : 1;
             // Crop and resize to 96x96
-            cropCenter(tflite_input_buffer, fb->width, fb->height, resized_frame, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE, channels);
-
+            cropCenter(tflite_input_buffer, frameBuffer->width, frameBuffer->height, resized_frame, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE, channels);
             // Convert to grayscale if needed
             if (channels == 3) {
                 convertRgb888ToGrayscale(resized_frame, gray_frame, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE);
             } else {
                 memcpy(gray_frame, resized_frame, TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE);
             }
-
             // Run inference
             TfLiteTensor* input = tf_wrapper.getInputTensor();
             if (input && input->dims && input->dims->size >= 4) {
                 bool person_present = tf_wrapper.runInference(gray_frame, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE);
                 ESP_LOGI(TF_TAG, "Person detected? %s", person_present ? "YES" : "NO");
-
                 if (person_present) {
                     led.turnLedOff();
                     led.turnBlueLedOn();
@@ -131,23 +131,28 @@ void capture_task(void *arg)
         } else {
             ESP_LOGW(CAPTURE_TAG, "Frame too small to resize to 96x96");
         }
+        tensorFlowTimer.checkpoint(TF_TAG, "tf inference done");
+        // ---
 
         // --- Copy JPEG frame for HTTP server ---
-        if (fb->format == PIXFORMAT_JPEG) {
+        httpTimer.checkpoint();
+        if (frameBuffer->format == PIXFORMAT_JPEG) {
             if (xSemaphoreTake(frame_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-                if (fb->len <= jpeg_buf_size) {
-                    memcpy(latest_frame, fb->buf, fb->len);
-                    latest_frame_len = fb->len;
+                if (frameBuffer->len <= jpeg_buf_size) {
+                    memcpy(latestFrameForHttpUploading, frameBuffer->buf, frameBuffer->len);
+                    latestFrameForHttpUploading_len = frameBuffer->len;
                 } else {
-                    ESP_LOGW(CAPTURE_TAG, "JPEG frame too large for buffer! len=%d", fb->len);
+                    ESP_LOGW(CAPTURE_TAG, "JPEG frame too large for buffer! len=%d", frameBuffer->len);
                 }
                 xSemaphoreGive(frame_mutex);
             } else {
                 ESP_LOGW(CAPTURE_TAG, "Failed to acquire frame mutex for HTTP frame");
             }
         }
+        httpTimer.checkpoint(HTTP_TAG, "frame uploading done");
+        // ---
 
-        esp_camera_fb_return(fb);
+        esp_camera_fb_return(frameBuffer);
         vTaskDelay(pdMS_TO_TICKS(10000));
     }
 }
@@ -161,8 +166,8 @@ esp_err_t capture_http_handler(httpd_req_t *req)
     }
     httpd_resp_set_type(req, "image/jpeg");
     esp_err_t res = httpd_resp_send(req,
-                                    reinterpret_cast<const char *>(latest_frame),
-                                    latest_frame_len); // use actual frame size
+                                    reinterpret_cast<const char *>(latestFrameForHttpUploading),
+                                    latestFrameForHttpUploading_len); // use actual frame size
     xSemaphoreGive(frame_mutex);
     return res;
 }
@@ -177,13 +182,18 @@ extern "C" void app_main(void)
     esp_chip_info(&chip_info);
     ESP_LOGI(OV2640_TAG, "This is %s chip with %d CPU core(s)", CONFIG_IDF_TARGET, (int)chip_info.cores);
 
+    if (!PSRAM::isAvailable()) {
+        ESP_LOGD(MAIN_TAG, "PSRAM NOT available.\n");
+        return;
+    }
+
     if (esp_flash_get_size(NULL, &flash_size) != ESP_OK) {
         ESP_LOGE(OV2640_TAG, "Get flash size failed");
         return;
     }
     ESP_LOGI(OV2640_TAG, "Flash size: %" PRIu32 " MB", flash_size / (1024 * 1024));
 
-    // --- CAMERA RESET SEQUENCE ---
+    // --- Camera reset sequence ---
     gpio_reset_pin((gpio_num_t)PWDN_GPIO_NUM);
     gpio_reset_pin((gpio_num_t)RESET_GPIO_NUM);
     gpio_set_direction((gpio_num_t)PWDN_GPIO_NUM, GPIO_MODE_OUTPUT);

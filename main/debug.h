@@ -10,6 +10,8 @@
 #define RAM_TAG "RAM"
 #define LED_TAG "Led"
 #define MAIN_TAG "Main"
+#define JPEG_TAG "Jpeg"
+#define HTTP_TAG "http"
 
 void log_RAM_status(const std::string& header);
 
