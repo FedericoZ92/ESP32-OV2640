@@ -98,7 +98,7 @@ void capture_task(void *arg)
                 continue;
             }
             tflite_input_buffer = rawImageBuffer;
-        } else if (frameBuffer->format == PIXFORMAT_GRAYSCALE || frameBuffer->format == PIXFORMAT_RGB565) {
+        } else if (frameBuffer->format == PIXFORMAT_GRAYSCALE) {
             tflite_input_buffer = frameBuffer->buf;
         } else {
             ESP_LOGW(CAPTURE_TAG, "Unsupported pixel format %d", frameBuffer->format);
@@ -114,12 +114,22 @@ void capture_task(void *arg)
         tensorFlowTimer.checkpoint();
         if (frameBuffer->width >= TF_IMAGE_INPUT_SIZE && frameBuffer->height >= TF_IMAGE_INPUT_SIZE) {
             int channels = (frameBuffer->format == PIXFORMAT_RGB565 || frameBuffer->format == PIXFORMAT_RGB888) ? 3 : 1;
-            // Crop and resize to 96x96
-            cropCenter(tflite_input_buffer, frameBuffer->width, frameBuffer->height, resized_frame, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE, channels);
-    
+                
             if (channels == 3) { // Convert to grayscale if needed
-                convertRgb888ToGrayscale(resized_frame, gray_frame, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE);
+                if (frameBuffer->format == PIXFORMAT_RGB565){
+                    convertRgb565ToGrayscale((uint16_t*)tflite_input_buffer, resized_frame, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE);
+                } else if (frameBuffer->format == PIXFORMAT_RGB888){
+                    convertRgb888ToGrayscale(tflite_input_buffer, resized_frame, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE);
+                } else {
+                    ESP_LOGW(CAPTURE_TAG, "Unsupported JPEG FORMAT) %d for RGB to grayscale conversion", frameBuffer->format);
+                }
+                // Crop and resize to 96x96
+                cropCenter(resized_frame, frameBuffer->width, frameBuffer->height, gray_frame, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE, 1);
+                //memcpy(gray_frame, resized_frame, TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE);
             } else {
+                // Crop and resize to 96x96
+                cropCenter(tflite_input_buffer, frameBuffer->width, frameBuffer->height, resized_frame, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE, 1);
+
                 memcpy(gray_frame, resized_frame, TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE);
             }
             // Run inference

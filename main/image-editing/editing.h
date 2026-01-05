@@ -17,6 +17,11 @@ void convertRgb888ToGrayscale(const uint8_t* rgb,
                             int width, 
                             int height);
 
+void convertRgb565ToGrayscale(const uint16_t* rgb565, 
+                                uint8_t* gray, 
+                                int width, 
+                                int height);
+
 void cropCenter(uint8_t* src, 
                 int src_width, 
                 int src_height, 

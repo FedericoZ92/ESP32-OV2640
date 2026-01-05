@@ -29,6 +29,19 @@ void convertRgb888ToGrayscale(const uint8_t* rgb, uint8_t* gray, int width, int 
     }
 }
 
+void convertRgb565ToGrayscale(const uint16_t* rgb565, uint8_t* gray, int width, int height) 
+{
+    int pixel_count = width * height;
+    for (int i = 0; i < pixel_count; ++i) {
+        uint16_t pix = rgb565[i];
+        uint8_t r = ((pix >> 11) & 0x1F) * 255 / 31;
+        uint8_t g = ((pix >> 5) & 0x3F) * 255 / 63;
+        uint8_t b = (pix & 0x1F) * 255 / 31;
+
+        gray[i] = (r * 30 + g * 59 + b * 11 + 50) / 100;
+    }
+}
+
 void cropCenter(uint8_t* src, int src_width, int src_height, 
                 uint8_t* dst, int crop_width, int crop_height, int channels)
 {
