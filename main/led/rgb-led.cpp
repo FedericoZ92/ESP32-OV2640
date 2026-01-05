@@ -1,6 +1,6 @@
-#include "led.h"
+#include "led/rgb-led.h"
 
-LedController::LedController(gpio_num_t gpio, rmt_channel_t channel)
+RgbLedController::RgbLedController(gpio_num_t gpio, rmt_channel_t channel)
     : led_gpio(gpio), rmt_channel(channel)
 {
     // Configure RMT for WS2812
@@ -21,12 +21,12 @@ LedController::LedController(gpio_num_t gpio, rmt_channel_t channel)
     ESP_LOGI(LED_TAG, "WS2812 LED configured on GPIO %d", led_gpio);
 }
 
-void LedController::turnRedLedOn()   { sendColor(255, 0, 0); }
-void LedController::turnGreenLedOn() { sendColor(0, 255, 0); }
-void LedController::turnBlueLedOn()  { sendColor(0, 0, 255); }
-void LedController::turnLedOff()     { sendColor(0, 0, 0); }
+void RgbLedController::turnRedLedOn()   { sendColor(255, 0, 0); }
+void RgbLedController::turnGreenLedOn() { sendColor(0, 255, 0); }
+void RgbLedController::turnBlueLedOn()  { sendColor(0, 0, 255); }
+void RgbLedController::turnLedOff()     { sendColor(0, 0, 0); }
 
-void LedController::sendColor(uint8_t red, uint8_t green, uint8_t blue)
+void RgbLedController::sendColor(uint8_t red, uint8_t green, uint8_t blue)
 {
     auto items = encodeWS2812(red, green, blue);
 
@@ -36,7 +36,7 @@ void LedController::sendColor(uint8_t red, uint8_t green, uint8_t blue)
 }
 
 // Encode one pixel (GRB order) into RMT waveform
-std::vector<rmt_item32_t> LedController::encodeWS2812(uint8_t red, uint8_t green, uint8_t blue)
+std::vector<rmt_item32_t> RgbLedController::encodeWS2812(uint8_t red, uint8_t green, uint8_t blue)
 {
     std::vector<rmt_item32_t> items;
     uint8_t colors[3] = { green, red, blue }; // WS2812 expects GRB
@@ -67,7 +67,7 @@ std::vector<rmt_item32_t> LedController::encodeWS2812(uint8_t red, uint8_t green
     return items;
 }
 
-void LedController::configureLedGpio2()
+void RgbLedController::configureLedGpio2()
 {
     gpio_config_t io_conf;
     io_conf.intr_type = GPIO_INTR_DISABLE;
@@ -78,7 +78,7 @@ void LedController::configureLedGpio2()
     gpio_config(&io_conf); 
 }
 
-void LedController::setLedGpio2(bool value)
+void RgbLedController::setLedGpio2(bool value)
 {
     gpio_set_level(GPIO_NUM_2, (uint32_t)value);   
 }

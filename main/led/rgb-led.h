@@ -6,10 +6,10 @@
 
 #define LED_TAG "LED"
 
-class LedController
+class RgbLedController
 {
 public:
-    explicit LedController(gpio_num_t gpio = GPIO_NUM_48, rmt_channel_t channel = RMT_CHANNEL_0);
+    explicit RgbLedController(gpio_num_t gpio = GPIO_NUM_48, rmt_channel_t channel = RMT_CHANNEL_0);
     void turnRedLedOn();
     void turnGreenLedOn();
     void turnBlueLedOn();

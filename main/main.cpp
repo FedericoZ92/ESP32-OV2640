@@ -15,7 +15,8 @@
 #include "tf-lite/tf-lite.h"
 #include "tflite-person-detect/person_detect_model_data.h"
 #include "image-editing/editing.h"
-#include "led/led.h"
+#include "led/rgb-led.h"
+#include "led/red-led.h"
 #include "psram/psram.h"
 #include "network.h"
 #include "checkpoint-timer/checkpoint-timer.h"
@@ -24,13 +25,18 @@
 // https://www.oceanlabz.in/getting-started-with-esp32-s3-wroom-n16r8-cam-dev-board/?srsltid=AfmBOors-1xeo_-CM5mcneEFHgQY9ps0qX2SHt8gf-S7Ndizot0T4vzk
 // in docs: schematics file from: https://www.homotix.it/vendita/moduli-wi-fi/scheda-esp32-s3-n16r8
 // https://github.com/microrobotics/ESP32-S3-N16R8/blob/main/ESP32-S3-N16R8_User_Guide.pdf
+// https://www.fruugo.it/esp32-s3-wroom-n16r8-modulo-fotocamera-per-scheda-di-sviluppo-cam-con-ov2640/p-358759907-780375612?language=it&ac=google&utm_source=google&utm_medium=paid&gad_source=1&gad_campaignid=22510258486&gbraid=0AAAAADpXug2uMu5_YIv6BL_H9NJZ76oa1&gclid=EAIaIQobChMI8brdxtT0kQMVuZqDBx1AHgjiEAQYASABEgI-qPD_BwE
+
 
 #define JPEG_BUFFER_SIZE 20 * 1024 // FRAMESIZE_QQVGA: 160x120
 #define ARENA_SIZE 128 * 1024;
 
 CameraHttpServer server;
 WifiManager wifi;
-LedController led = LedController(GPIO_NUM_38);
+RgbLedController rgb(GPIO_NUM_48, RMT_CHANNEL_0); // 8 LEDs on GPIO48
+    
+RedLedController redLed = RedLedController();
+
 CheckpointTimer jpegTimer;
 CheckpointTimer cameraAcquisitionTimer;
 CheckpointTimer tensorFlowTimer;
@@ -118,12 +124,13 @@ void capture_task(void *arg)
                 bool person_present = tf_wrapper.runInference(gray_frame, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE);
                 ESP_LOGI(TF_TAG, "Person detected? %s", person_present ? "YES" : "NO");
                 if (person_present) {
-                    led.turnLedOff();
-                    led.turnBlueLedOn();
+                    redLed.setLedGpio2(0);
+                    rgb.turnBlueLedOn(); // blue
+
                 } else {
-                    led.setLedGpio2(1);
-                    led.turnLedOff();
-                    led.turnRedLedOn();
+                    redLed.setLedGpio2(1);
+                    rgb.turnRedLedOn(); // red
+
                 }
             } else {
                 ESP_LOGE(TF_TAG, "Input tensor is null or malformed");

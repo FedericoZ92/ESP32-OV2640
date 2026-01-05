@@ -7,7 +7,8 @@ idf_component_register(
          "tflite-person-detect/person_detect_model_data.cc"
          "image-editing/editing.cpp"
          "debug.cpp"
-         "led/led.cpp"
+         "led/rgb-led.cpp"
+         "led/red-led.cpp"
          "psram/psram.cpp"
          "checkpoint-timer/checkpoint-timer.cpp"
 
