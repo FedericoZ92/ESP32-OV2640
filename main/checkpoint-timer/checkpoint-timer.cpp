@@ -15,10 +15,11 @@ void CheckpointTimer::checkpoint()
 }
 
 // Updates the checkpoint to the current time
-void CheckpointTimer::checkpoint(std::string tag, std::string message)
+void CheckpointTimer::logCheckpoint(std::string tag, std::string message)
 {
-    last_checkpoint_us = esp_timer_get_time();
-    ESP_LOGD(tag.c_str(), "*** Elapsed: %" PRId32 " ms: %s ***", elapsedMs(), message.c_str());
+    int32_t elapsed = elapsedMs();       // compute elapsed BEFORE updating checkpoint
+    ESP_LOGI(tag.c_str(), "*** Elapsed: %" PRId32 " ms: %s ***", elapsed, message.c_str());
+    checkpoint();                        // now update the checkpoint
 }
 
 // Returns elapsed time in microseconds

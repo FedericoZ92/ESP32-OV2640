@@ -66,6 +66,7 @@ void capture_task(void *arg)
 
     while (true) {
         // --- Handle JPEG decoding or raw frame ---
+        ESP_LOGI(CAPTURE_TAG, "Handle JPEG decoding or raw frame, mark checkpoint"); 
         cameraAcquisitionTimer.checkpoint();
         camera_fb_t *frameBuffer = esp_camera_fb_get();
         if (!frameBuffer) {
@@ -74,10 +75,12 @@ void capture_task(void *arg)
             continue;
         }
         ESP_LOGI(CAPTURE_TAG, "Frame: %dx%d, len=%d, format=%d", frameBuffer->width, frameBuffer->height, frameBuffer->len, frameBuffer->format);
-        cameraAcquisitionTimer.checkpoint(CAPTURE_TAG, "frame captured");
+        cameraAcquisitionTimer.logCheckpoint(CAPTURE_TAG, "frame captured");
+        
         // ---
 
         // --- Handle JPEG decoding to raw frame ---
+        ESP_LOGI(CAPTURE_TAG, "Handle JPEG decoding to raw frame"); 
         jpegTimer.checkpoint();
         // Free previous decoded buffer
         if (rawImageBuffer) {
@@ -103,17 +106,18 @@ void capture_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
-        jpegTimer.checkpoint(JPEG_TAG, "raw to jpeg conversion done");
+        jpegTimer.logCheckpoint(JPEG_TAG, "raw to jpeg conversion done");
         // ---
 
         // --- TensorFlow Lite inference ---
+        ESP_LOGI(CAPTURE_TAG, "TensorFlow Lite inference"); 
         tensorFlowTimer.checkpoint();
         if (frameBuffer->width >= TF_IMAGE_INPUT_SIZE && frameBuffer->height >= TF_IMAGE_INPUT_SIZE) {
             int channels = (frameBuffer->format == PIXFORMAT_RGB565 || frameBuffer->format == PIXFORMAT_RGB888) ? 3 : 1;
             // Crop and resize to 96x96
             cropCenter(tflite_input_buffer, frameBuffer->width, frameBuffer->height, resized_frame, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE, channels);
-            // Convert to grayscale if needed
-            if (channels == 3) {
+    
+            if (channels == 3) { // Convert to grayscale if needed
                 convertRgb888ToGrayscale(resized_frame, gray_frame, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE);
             } else {
                 memcpy(gray_frame, resized_frame, TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE);
@@ -122,7 +126,7 @@ void capture_task(void *arg)
             TfLiteTensor* input = tf_wrapper.getInputTensor();
             if (input && input->dims && input->dims->size >= 4) {
                 bool person_present = tf_wrapper.runInference(gray_frame, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE);
-                ESP_LOGI(TF_TAG, "Person detected? %s", person_present ? "YES" : "NO");
+                ESP_LOGW(TF_TAG, "Person detected? %s", person_present ? "YES" : "NO");
                 if (person_present) {
                     redLed.setLedGpio2(0);
                     rgb.turnBlueLedOn(); // blue
@@ -138,10 +142,11 @@ void capture_task(void *arg)
         } else {
             ESP_LOGW(CAPTURE_TAG, "Frame too small to resize to 96x96");
         }
-        tensorFlowTimer.checkpoint(TF_TAG, "tf inference done");
+        tensorFlowTimer.logCheckpoint(TF_TAG, "tf inference done");
         // ---
 
         // --- Copy JPEG frame for HTTP server ---
+        ESP_LOGI(CAPTURE_TAG, "Copy JPEG frame for HTTP server, ip: %s", wifi.getLocalIP().c_str()); 
         httpTimer.checkpoint();
         if (frameBuffer->format == PIXFORMAT_JPEG) {
             if (xSemaphoreTake(frame_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
@@ -156,11 +161,13 @@ void capture_task(void *arg)
                 ESP_LOGW(CAPTURE_TAG, "Failed to acquire frame mutex for HTTP frame");
             }
         }
-        httpTimer.checkpoint(HTTP_TAG, "frame uploading done");
+        httpTimer.logCheckpoint(HTTP_TAG, "frame uploading done");
         // ---
 
         esp_camera_fb_return(frameBuffer);
-        vTaskDelay(pdMS_TO_TICKS(10000));
+
+        ESP_LOGI(CAPTURE_TAG, "Wait 5s"); 
+        vTaskDelay(pdMS_TO_TICKS(5000));
     }
 }
 

@@ -32,8 +32,8 @@ static const char *INDEX_HTML = R"rawliteral(
       }
 
       // When an image finishes loading, request the next one
-      img.onload = () => setTimeout(reload, 10000);  // 10000 ms pause between frames
-      img.onerror = () => setTimeout(reload, 10000); // retry slower on errors
+      img.onload = () => setTimeout(reload, 10000);  // 10000 ms ≈ 0.1 fps
+      img.onerror = () => setTimeout(reload, 10000); // retry a bit slower
 
       reload(); // start the loop
     });

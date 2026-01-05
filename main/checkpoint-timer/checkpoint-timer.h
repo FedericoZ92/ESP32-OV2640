@@ -14,7 +14,7 @@ public:
     void checkpoint();
 
     // Marks the current time as the latest checkpoint
-    void checkpoint(std::string tag, std::string message);
+    void logCheckpoint(std::string tag, std::string message);
 
     // Returns microseconds since the last checkpoint
     int64_t elapsedUs() const;

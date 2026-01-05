@@ -36,8 +36,8 @@ TfLiteWrapper::TfLiteWrapper(const unsigned char* model_data, size_t arena_size_
     //- Intermediate tensors
     //- Scratch buffers
     //- Activations
-    ESP_LOGI(TF_TAG, "Largest allocatable block: %d", heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-    ESP_LOGI(TF_TAG, "Free heap before arena allocation: %d, arena size: %d", (int)esp_get_free_heap_size(), (int)arena_size);
+    ESP_LOGD(TF_TAG, "Largest allocatable block: %d", heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    ESP_LOGD(TF_TAG, "Free heap before arena allocation: %d, arena size: %d", (int)esp_get_free_heap_size(), (int)arena_size);
         tensor_arena = (uint8_t*)heap_caps_malloc(arena_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!tensor_arena) {
         ESP_LOGE(TF_TAG, "Failed to allocate tensor arena!");
@@ -83,13 +83,17 @@ bool TfLiteWrapper::runInference(const uint8_t* image_data, int width, int heigh
         return false;
     }
 
-    ESP_LOGI(TF_TAG, "Input tensor type: %d", input->type);
+    ESP_LOGD(TF_TAG, "Input tensor type: %d", input->type);
 
     // Log first few input pixels
-    ESP_LOGI(TF_TAG, "First 10 input pixels:");
+    std::string somePixels = ""; 
     for (int i = 0; i < 10 && i < width * height; i++) {
-        ESP_LOGI(TF_TAG, "%d: %u", i, image_data[i]);
+        somePixels += std::to_string(image_data[i]);
+        if (i < 9 && i < width * height - 1) {
+            somePixels += ", ";
+        }
     }
+    ESP_LOGD(TF_TAG, "First input pixels: %s", somePixels.c_str());
 
     // Copy image data into input tensor
     int expected_size = width * height;
@@ -133,23 +137,23 @@ bool TfLiteWrapper::runInference(const uint8_t* image_data, int width, int heigh
         num_outputs = output->dims->data[output->dims->size - 1];
     }
 
-    ESP_LOGI(TF_TAG, "Output tensor type: %d, size: %d", output->type, num_outputs);
+    ESP_LOGD(TF_TAG, "Output tensor type: %d, size: %d", output->type, num_outputs);
 
     // Print first few output values
-    ESP_LOGI(TF_TAG, "Output values:");
+    ESP_LOGD(TF_TAG, "Output values:");
     if (output->type == kTfLiteFloat32) {
         for (int i = 0; i < num_outputs; i++) {
-            ESP_LOGI(TF_TAG, "output[%d] = %f", i, output->data.f[i]);
+            ESP_LOGD(TF_TAG, "output[%d] = %f", i, output->data.f[i]);
         }
     } else if (output->type == kTfLiteUInt8) {
         for (int i = 0; i < num_outputs; i++) {
-            ESP_LOGI(TF_TAG, "output[%d] = %u", i, output->data.uint8[i]);
+            ESP_LOGD(TF_TAG, "output[%d] = %u", i, output->data.uint8[i]);
         }
     } else if (output->type == kTfLiteInt8) {
         for (int i = 0; i < num_outputs; i++) {
             int8_t raw = output->data.int8[i];
             float dequantized = (raw - output->params.zero_point) * output->params.scale;
-            ESP_LOGI(TF_TAG, "output[%d] = %d (dequantized: %f)", i, raw, dequantized);
+            ESP_LOGD(TF_TAG, "output[%d] = %d (dequantized: %f)", i, raw, dequantized);
         }
     } else {
         ESP_LOGW(TF_TAG, "Unknown output tensor type: %d", output->type);
@@ -174,10 +178,8 @@ bool TfLiteWrapper::runInference(const uint8_t* image_data, int width, int heigh
         ESP_LOGW(TF_TAG, "Unsupported output tensor type: %d", output->type);
     }
 
-    ESP_LOGI(TF_TAG, "Person confidence: %f", confidence);
+    ESP_LOGD(TF_TAG, "Person confidence: %f", confidence);
     bool detected = confidence > 0.5f;
-    ESP_LOGI(TF_TAG, "Person detected? %s", detected ? "YES" : "NO");
-
     return detected;
 }
 
