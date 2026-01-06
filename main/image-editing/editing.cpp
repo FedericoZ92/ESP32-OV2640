@@ -5,6 +5,7 @@
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 
+
 void resizeRgbNearestNeighbor(const uint8_t* src, int in_width, int in_height,
                            uint8_t* dst, int out_width, int out_height) {
     for (int y = 0; y < out_height; y++) {
@@ -19,26 +20,26 @@ void resizeRgbNearestNeighbor(const uint8_t* src, int in_width, int in_height,
     }
 }
 
-void convertRgb888ToGrayscale(const uint8_t* rgb, uint8_t* gray, int width, int height) {
+void convertRgb565ToGrayscale(const uint16_t* rgb565, uint8_t* gray, int width, int height) 
+{ 
+    int pixel_count = width * height; 
+    for (int i = 0; i < pixel_count; ++i) { 
+        uint16_t pix = rgb565[i]; 
+        uint8_t r = ((pix >> 11) & 0x1F) * 255 / 31; 
+        uint8_t g = ((pix >> 5) & 0x3F) * 255 / 63; 
+        uint8_t b = (pix & 0x1F) * 255 / 31; 
+        gray[i] = (r * 30 + g * 59 + b * 11 + 50) / 100; 
+    } 
+}
+
+void convertRgb888ToGrayscale(const uint8_t* rgb, uint8_t* gray, int width, int height) 
+{
     int pixel_count = width * height;
     for (int i = 0; i < pixel_count; ++i) {
         uint8_t r = rgb[i * 3];
         uint8_t g = rgb[i * 3 + 1];
         uint8_t b = rgb[i * 3 + 2];
         gray[i] = (r * 30 + g * 59 + b * 11) / 100;  // Weighted average
-    }
-}
-
-void convertRgb565ToGrayscale(const uint16_t* rgb565, uint8_t* gray, int width, int height) 
-{
-    int pixel_count = width * height;
-    for (int i = 0; i < pixel_count; ++i) {
-        uint16_t pix = rgb565[i];
-        uint8_t r = ((pix >> 11) & 0x1F) * 255 / 31;
-        uint8_t g = ((pix >> 5) & 0x3F) * 255 / 63;
-        uint8_t b = (pix & 0x1F) * 255 / 31;
-
-        gray[i] = (r * 30 + g * 59 + b * 11 + 50) / 100;
     }
 }
 
@@ -94,3 +95,22 @@ uint8_t* allocatingDecodeCameraJpeg(camera_fb_t *fb,
 
     return out_buf;   // caller frees
 }
+
+// Converts a grayscale buffer to RGB888
+// grayscale: input buffer (1 byte per pixel)
+// rgb: output buffer (must be pre-allocated, 3 bytes per pixel)
+// width, height: dimensions of the image
+void convertGrayscaleToRgb888(const uint8_t* grayscale, uint8_t* rgb, int width, int height)
+{
+    if (!grayscale || !rgb) return;
+
+    int pixel_count = width * height;
+    for (int i = 0; i < pixel_count; ++i) {
+        uint8_t val = grayscale[i];
+        rgb[i * 3 + 0] = val;  // R
+        rgb[i * 3 + 1] = val;  // G
+        rgb[i * 3 + 2] = val;  // B
+    }
+}
+
+

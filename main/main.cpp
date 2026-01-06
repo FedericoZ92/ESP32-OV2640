@@ -20,6 +20,7 @@
 #include "psram/psram.h"
 #include "network.h"
 #include "checkpoint-timer/checkpoint-timer.h"
+#include "util/misc.h"
 
 // OV2640 pin map for ESP32-S3-CAM-N16R8
 // https://www.oceanlabz.in/getting-started-with-esp32-s3-wroom-n16r8-cam-dev-board/?srsltid=AfmBOors-1xeo_-CM5mcneEFHgQY9ps0qX2SHt8gf-S7Ndizot0T4vzk
@@ -27,6 +28,7 @@
 // https://github.com/microrobotics/ESP32-S3-N16R8/blob/main/ESP32-S3-N16R8_User_Guide.pdf
 // https://www.fruugo.it/esp32-s3-wroom-n16r8-modulo-fotocamera-per-scheda-di-sviluppo-cam-con-ov2640/p-358759907-780375612?language=it&ac=google&utm_source=google&utm_medium=paid&gad_source=1&gad_campaignid=22510258486&gbraid=0AAAAADpXug2uMu5_YIv6BL_H9NJZ76oa1&gclid=EAIaIQobChMI8brdxtT0kQMVuZqDBx1AHgjiEAQYASABEgI-qPD_BwE
 
+// camera parameters in camera-driver.cpp!
 
 #define JPEG_BUFFER_SIZE 20 * 1024 // FRAMESIZE_QQVGA: 160x120
 #define ARENA_SIZE 128 * 1024;
@@ -43,21 +45,21 @@ CheckpointTimer tensorFlowTimer;
 CheckpointTimer httpTimer;
 
 // --- Shared static frame buffer ---
-static uint8_t *latestFrameForHttpUploading = NULL;
+static uint8_t *latestFrameForHttpUploading = (uint8_t*) heap_caps_malloc(JPEG_BUFFER_SIZE, MALLOC_CAP_SPIRAM);;
 static SemaphoreHandle_t frame_mutex = nullptr;
 static TfLiteWrapper tf_wrapper;
 static size_t latestFrameForHttpUploading_len = 0; // store size of latest JPEG frame
 uint8_t *rawImageBuffer = nullptr; // raw pixels
-uint8_t* tflite_input_buffer = nullptr; // default: raw buffer
-static uint8_t gray_frame[TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE];
+uint8_t* tflitePreEditingBuffer = nullptr; // default: raw buffer
+static uint8_t tfliteGray96x96InputBuffer[TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE];
 
 // Background task: capture a new frame every 10 seconds
 void capture_task(void *arg)
 {
     ESP_LOGI(CAPTURE_TAG, "Camera capture task started");
-    static uint8_t resized_frame[TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE];  // Grayscale input for TFLite
-    const size_t jpeg_buf_size = JPEG_BUFFER_SIZE;
-    latestFrameForHttpUploading = (uint8_t*) heap_caps_malloc(jpeg_buf_size, MALLOC_CAP_SPIRAM);
+    static uint8_t processedFrame[TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE];
+    const size_t jpegBufferSize = JPEG_BUFFER_SIZE;
+    latestFrameForHttpUploading = (uint8_t*) heap_caps_malloc(jpegBufferSize, MALLOC_CAP_SPIRAM);
     if (!latestFrameForHttpUploading) {
         ESP_LOGE(CAPTURE_TAG, "Failed to allocate PSRAM buffer for JPEG frames!");
         return;
@@ -76,7 +78,7 @@ void capture_task(void *arg)
         }
         ESP_LOGI(CAPTURE_TAG, "Frame: %dx%d, len=%d, format=%d", frameBuffer->width, frameBuffer->height, frameBuffer->len, frameBuffer->format);
         cameraAcquisitionTimer.logCheckpoint(CAPTURE_TAG, "frame captured");
-        
+    
         // ---
 
         // --- Handle JPEG decoding to raw frame ---
@@ -97,9 +99,9 @@ void capture_task(void *arg)
                 esp_camera_fb_return(frameBuffer);
                 continue;
             }
-            tflite_input_buffer = rawImageBuffer;
+            tflitePreEditingBuffer = rawImageBuffer;
         } else if (frameBuffer->format == PIXFORMAT_GRAYSCALE) {
-            tflite_input_buffer = frameBuffer->buf;
+            tflitePreEditingBuffer = frameBuffer->buf;
         } else {
             ESP_LOGW(CAPTURE_TAG, "Unsupported pixel format %d", frameBuffer->format);
             esp_camera_fb_return(frameBuffer);
@@ -117,25 +119,26 @@ void capture_task(void *arg)
                 
             if (channels == 3) { // Convert to grayscale if needed
                 if (frameBuffer->format == PIXFORMAT_RGB565){
-                    convertRgb565ToGrayscale((uint16_t*)tflite_input_buffer, resized_frame, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE);
+                    convertRgb565ToGrayscale((uint16_t*)tflitePreEditingBuffer, processedFrame, frameBuffer->width, frameBuffer->height);
                 } else if (frameBuffer->format == PIXFORMAT_RGB888){
-                    convertRgb888ToGrayscale(tflite_input_buffer, resized_frame, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE);
+                    convertRgb888ToGrayscale(tflitePreEditingBuffer, processedFrame, frameBuffer->width, frameBuffer->height);
                 } else {
                     ESP_LOGW(CAPTURE_TAG, "Unsupported JPEG FORMAT) %d for RGB to grayscale conversion", frameBuffer->format);
                 }
                 // Crop and resize to 96x96
-                cropCenter(resized_frame, frameBuffer->width, frameBuffer->height, gray_frame, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE, 1);
-                //memcpy(gray_frame, resized_frame, TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE);
+                cropCenter(processedFrame, frameBuffer->width, frameBuffer->height, tfliteGray96x96InputBuffer, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE, 1);
+                
             } else {
                 // Crop and resize to 96x96
-                cropCenter(tflite_input_buffer, frameBuffer->width, frameBuffer->height, resized_frame, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE, 1);
+                cropCenter(tflitePreEditingBuffer, frameBuffer->width, frameBuffer->height, processedFrame, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE, 1);
 
-                memcpy(gray_frame, resized_frame, TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE);
+                memcpy(tfliteGray96x96InputBuffer, processedFrame, TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE);
             }
             // Run inference
             TfLiteTensor* input = tf_wrapper.getInputTensor();
             if (input && input->dims && input->dims->size >= 4) {
-                bool person_present = tf_wrapper.runInference(gray_frame, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE);
+                logFirstPixels(TF_TAG, "tfliteGray96x96InputBuffer", tfliteGray96x96InputBuffer, 10);
+                bool person_present = tf_wrapper.runInference(tfliteGray96x96InputBuffer, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE);
                 ESP_LOGW(TF_TAG, "Person detected? %s", person_present ? "YES" : "NO");
                 if (person_present) {
                     redLed.setLedGpio2(0);
@@ -155,45 +158,54 @@ void capture_task(void *arg)
         tensorFlowTimer.logCheckpoint(TF_TAG, "tf inference done");
         // ---
 
-        // --- Copy JPEG frame for HTTP server ---
-        ESP_LOGI(CAPTURE_TAG, "Copy JPEG frame for HTTP server, ip: %s", wifi.getLocalIP().c_str()); 
+        // --- Copy processed grayscale buffer for HTTP server ---
+        ESP_LOGI(CAPTURE_TAG, "Copy processed frame for HTTP server, IP: %s", wifi.getLocalIP().c_str());
         httpTimer.checkpoint();
-        if (frameBuffer->format == PIXFORMAT_JPEG) {
-            if (xSemaphoreTake(frame_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-                if (frameBuffer->len <= jpeg_buf_size) {
-                    memcpy(latestFrameForHttpUploading, frameBuffer->buf, frameBuffer->len);
-                    latestFrameForHttpUploading_len = frameBuffer->len;
-                } else {
-                    ESP_LOGW(CAPTURE_TAG, "JPEG frame too large for buffer! len=%d", frameBuffer->len);
-                }
-                xSemaphoreGive(frame_mutex);
+
+        // Copy grayscale buffer directly (1 byte per pixel) to HTTP upload buffer
+        const int gray_size = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE; // 96x96
+        if (xSemaphoreTake(frame_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            if (gray_size <= JPEG_BUFFER_SIZE) {
+                memcpy(latestFrameForHttpUploading, tfliteGray96x96InputBuffer, gray_size);
+                latestFrameForHttpUploading_len = gray_size;
             } else {
-                ESP_LOGW(CAPTURE_TAG, "Failed to acquire frame mutex for HTTP frame");
+                ESP_LOGW(CAPTURE_TAG, "Processed grayscale frame too large for HTTP buffer! len=%d", gray_size);
             }
+            xSemaphoreGive(frame_mutex);
+        } else {
+            ESP_LOGW(CAPTURE_TAG, "Failed to acquire frame mutex for HTTP frame");
         }
+
         httpTimer.logCheckpoint(HTTP_TAG, "frame uploading done");
         // ---
 
         esp_camera_fb_return(frameBuffer);
 
-        ESP_LOGI(CAPTURE_TAG, "Wait 5s"); 
-        vTaskDelay(pdMS_TO_TICKS(5000));
+        ESP_LOGI(CAPTURE_TAG, "Wait 1s"); 
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
-// HTTP handler — returns the latest captured frame
-esp_err_t capture_http_handler(httpd_req_t *req)
+// HTTP handler — returns the latest captured grayscale frame
+esp_err_t captureRgbCallback(httpd_req_t *req)
 {
-    if (xSemaphoreTake(frame_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
-        httpd_resp_send_500(req);
+    if (xSemaphoreTake(frame_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+        httpd_resp_set_type(req, "application/octet-stream");
+
+        if (latestFrameForHttpUploading_len > 0) {
+            httpd_resp_send(req, (const char*)latestFrameForHttpUploading, latestFrameForHttpUploading_len);
+        } else {
+            // send a blank frame
+            static uint8_t blank[TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE] = {0};
+            httpd_resp_send(req, (const char*)blank, sizeof(blank));
+        }
+
+        xSemaphoreGive(frame_mutex);
+        return ESP_OK;
+    } else {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to acquire mutex");
         return ESP_FAIL;
     }
-    httpd_resp_set_type(req, "image/jpeg");
-    esp_err_t res = httpd_resp_send(req,
-                                    reinterpret_cast<const char *>(latestFrameForHttpUploading),
-                                    latestFrameForHttpUploading_len); // use actual frame size
-    xSemaphoreGive(frame_mutex);
-    return res;
 }
 
 extern "C" void app_main(void)
@@ -274,7 +286,7 @@ extern "C" void app_main(void)
         return;
     }
 
-    server.setCaptureHandler(capture_http_handler);
+    server.setCaptureHandler(captureRgbCallback);
     if (server.start() == ESP_OK) {
         ESP_LOGI(OV2640_TAG, "HTTP Server started. Open http://%s/capture.jpg", wifi.getLocalIP().c_str());
     } else {

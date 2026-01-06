@@ -6,7 +6,7 @@ CameraHttpServer::CameraHttpServer() = default;
 CameraHttpServer::~CameraHttpServer() { stop(); }
 
 // ============================
-// HTML page for live view
+// HTML page for live view using <canvas>
 // ============================
 static const char *INDEX_HTML = R"rawliteral(
 <!DOCTYPE html>
@@ -15,28 +15,40 @@ static const char *INDEX_HTML = R"rawliteral(
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>ESP32 Camera Live View</title>
-  <style>
-    body { background:#111; color:#eee; text-align:center; font-family:sans-serif; margin:0; }
-    img  { border:2px solid #444; border-radius:8px; margin-top:10px; width:320px; height:auto; }
-  </style>
 </head>
 <body>
-  <h2>ESP32 Camera Live View</h2>
-  <img id="cam" src="/capture.jpg" />
+  <h2>ESP32 Camera Live View (Grayscale)</h2>
+  <canvas id="camCanvas" width="96" height="96"></canvas>
   <script>
-    document.addEventListener('DOMContentLoaded', () => {
-      const img = document.getElementById('cam');
+    const canvas = document.getElementById('camCanvas');
+    const ctx = canvas.getContext('2d');
+    const width = 96;
+    const height = 96;
+    const imageData = ctx.createImageData(width, height);
 
-      function reload() {
-        img.src = '/capture.jpg?_=' + Date.now();
+    async function fetchFrame() {
+      try {
+        const response = await fetch('/capture.rgb');
+        const buffer = await response.arrayBuffer();
+        const gray = new Uint8Array(buffer);
+
+        for (let i = 0; i < gray.length; i++) {
+          const j = i * 4;
+          imageData.data[j + 0] = gray[i]; // R
+          imageData.data[j + 1] = gray[i]; // G
+          imageData.data[j + 2] = gray[i]; // B
+          imageData.data[j + 3] = 255;     // A
+        }
+
+        ctx.putImageData(imageData, 0, 0);
+      } catch (err) {
+        console.error(err);
+      } finally {
+        setTimeout(fetchFrame, 1000); // next frame in 1000ms
       }
+    }
 
-      // When an image finishes loading, request the next one
-      img.onload = () => setTimeout(reload, 10000);  // 10000 ms ≈ 0.1 fps
-      img.onerror = () => setTimeout(reload, 10000); // retry a bit slower
-
-      reload(); // start the loop
-    });
+    fetchFrame();
   </script>
 </body>
 </html>
@@ -66,7 +78,7 @@ esp_err_t CameraHttpServer::start(uint16_t port)
     httpd_uri_t uri_root = {
         .uri = "/",
         .method = HTTP_GET,
-        .handler = [](httpd_req_t *req) {
+        .handler = [](httpd_req_t *req) -> esp_err_t {
             httpd_resp_set_type(req, "text/html");
             httpd_resp_set_hdr(req, "Cache-Control", "no-store");
             ESP_LOGI("CameraHttpServer", "Serving index page");
@@ -76,14 +88,24 @@ esp_err_t CameraHttpServer::start(uint16_t port)
     };
     httpd_register_uri_handler(serverHandle, &uri_root);
 
-    // --- Capture handler: serves JPEG frames ---
-    httpd_uri_t uri_capture = {
-        .uri = "/capture.jpg",
+    // --- Capture RGB handler: serves raw grayscale frames ---
+    httpd_uri_t uri_capture_rgb = {
+        .uri = "/capture.rgb",
         .method = HTTP_GET,
-        .handler = handleCapture,
+        .handler = [](httpd_req_t *req) -> esp_err_t {
+            if (CameraHttpServer::s_captureCallback) {
+                httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+                httpd_resp_set_hdr(req, "Pragma", "no-cache");
+                httpd_resp_set_hdr(req, "Expires", "0");
+                return CameraHttpServer::s_captureCallback(req);
+            } else {
+                httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No capture handler");
+                return ESP_FAIL;
+            }
+        },
         .user_ctx = nullptr
     };
-    httpd_register_uri_handler(serverHandle, &uri_capture);
+    httpd_register_uri_handler(serverHandle, &uri_capture_rgb);
 
     ESP_LOGI(TAG, "HTTP server started on port %u", port);
     return ESP_OK;
@@ -110,7 +132,7 @@ void CameraHttpServer::setCaptureHandler(CaptureCallback callback)
 }
 
 // ============================
-// /capture.jpg handler
+// Generic capture handler
 // ============================
 esp_err_t CameraHttpServer::handleCapture(httpd_req_t *req)
 {

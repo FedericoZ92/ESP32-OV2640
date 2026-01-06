@@ -1,6 +1,6 @@
 #pragma once
 #include <stdint.h>
-#include "esp_camera.h"
+#include <esp_camera.h>
 
 // Resize an RGB888 image using nearest neighbor
 // src: pointer to input image (width x height x 3)
@@ -34,3 +34,8 @@ uint8_t* allocatingDecodeCameraJpeg(camera_fb_t *fb,
                                     uint32_t memory_type,
                                     esp_jpeg_image_format_t out_format,
                                     esp_jpeg_image_scale_t scale);
+
+void convertGrayscaleToRgb888(const uint8_t* grayscale, 
+                                uint8_t* rgb, 
+                                int width, 
+                                int height);

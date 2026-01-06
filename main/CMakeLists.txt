@@ -11,6 +11,7 @@ idf_component_register(
          "led/red-led.cpp"
          "psram/psram.cpp"
          "checkpoint-timer/checkpoint-timer.cpp"
+         "util/misc.cpp"
 
     INCLUDE_DIRS "."
                  "../managed_components/espressif__esp_jpeg"

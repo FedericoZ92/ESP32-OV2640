@@ -85,16 +85,6 @@ bool TfLiteWrapper::runInference(const uint8_t* image_data, int width, int heigh
 
     ESP_LOGD(TF_TAG, "Input tensor type: %d", input->type);
 
-    // Log first few input pixels
-    std::string somePixels = ""; 
-    for (int i = 0; i < 10 && i < width * height; i++) {
-        somePixels += std::to_string(image_data[i]);
-        if (i < 9 && i < width * height - 1) {
-            somePixels += ", ";
-        }
-    }
-    ESP_LOGD(TF_TAG, "First input pixels: %s", somePixels.c_str());
-
     // Copy image data into input tensor
     int expected_size = width * height;
     if (input->type == kTfLiteUInt8) {
@@ -179,7 +169,7 @@ bool TfLiteWrapper::runInference(const uint8_t* image_data, int width, int heigh
     }
 
     ESP_LOGD(TF_TAG, "Person confidence: %f", confidence);
-    bool detected = confidence > 0.5f;
+    bool detected = confidence > DETECTION_THRESHOLD;
     return detected;
 }
 
