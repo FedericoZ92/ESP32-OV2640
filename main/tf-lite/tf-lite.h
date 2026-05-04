@@ -17,7 +17,7 @@
 class TfLiteWrapper {
 public:
     TfLiteWrapper() = default;
-    TfLiteWrapper(const unsigned char* model_data, size_t arena_size = 10*1024);
+    TfLiteWrapper(const unsigned char* model_data, size_t arena_size = 10*1024, uint8_t* arena_buffer = nullptr);
 
     bool runInference(const uint8_t* image_data, int width, int height);
     uint8_t* getOutputDataUint8() const;

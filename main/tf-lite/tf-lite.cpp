@@ -7,8 +7,8 @@
 #include "esp_system.h"
 #include "debug.h"
 
-TfLiteWrapper::TfLiteWrapper(const unsigned char* model_data, size_t arena_size_)
-: model(nullptr), interpreter(nullptr), tensor_arena(nullptr), arena_size(arena_size_)
+TfLiteWrapper::TfLiteWrapper(const unsigned char* model_data, size_t arena_size_, uint8_t* arena_buffer)
+: model(nullptr), interpreter(nullptr), tensor_arena(arena_buffer), arena_size(arena_size_)
 {
     // Map model
     model = tflite::GetModel(model_data);
@@ -38,10 +38,15 @@ TfLiteWrapper::TfLiteWrapper(const unsigned char* model_data, size_t arena_size_
     //- Activations
     ESP_LOGD(TF_TAG, "Largest allocatable block: %d", heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     ESP_LOGD(TF_TAG, "Free heap before arena allocation: %d, arena size: %d", (int)esp_get_free_heap_size(), (int)arena_size);
+
+    if (tensor_arena) {
+        ESP_LOGI(TF_TAG, "Using caller-provided tensor arena at %p", tensor_arena);
+    } else {
         tensor_arena = (uint8_t*)heap_caps_malloc(arena_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (!tensor_arena) {
-        ESP_LOGE(TF_TAG, "Failed to allocate tensor arena!");
-        return;
+        if (!tensor_arena) {
+            ESP_LOGE(TF_TAG, "Failed to allocate tensor arena!");
+            return;
+        }
     }
 
     // Create interpreter
