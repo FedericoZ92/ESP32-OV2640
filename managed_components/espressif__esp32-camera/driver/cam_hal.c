@@ -40,7 +40,12 @@
 #include "esp32s3/rom/ets_sys.h"
 #endif
 #endif // ESP_IDF_VERSION_MAJOR
-#define ESP_CAMERA_ETS_PRINTF ets_printf
+
+#if CONFIG_LOG_DEFAULT_LEVEL_NONE
+#define ESP_CAMERA_ETS_PRINTF(f, ...)
+#else
+#define ESP_CAMERA_ETS_PRINTF(f, ...) ets_printf(f, ##__VA_ARGS__)
+#endif
 
 #if CONFIG_CAMERA_TASK_STACK_SIZE
 #define CAM_TASK_STACK             CONFIG_CAMERA_TASK_STACK_SIZE
@@ -257,7 +262,7 @@ void IRAM_ATTR ll_cam_send_event(cam_obj_t *cam, cam_event_t cam_event, BaseType
     }
 }
 
-//Copy fram from DMA dma_buffer to fram dma_buffer
+//Copy frame from DMA dma_buffer to frame dma_buffer
 static void cam_task(void *arg)
 {
     int cnt = 0;

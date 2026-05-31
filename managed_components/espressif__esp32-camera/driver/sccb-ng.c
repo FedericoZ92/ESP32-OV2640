@@ -23,7 +23,10 @@ static const char *TAG = "sccb-ng";
 
 #define LITTLETOBIG(x) ((x << 8) | (x >> 8))
 
+#if (ESP_IDF_VERSION_MAJOR <= 5)
 #include "esp_private/i2c_platform.h"
+#endif
+
 #include "driver/i2c_master.h"
 #include "driver/i2c_types.h"
 
@@ -44,8 +47,8 @@ const int SCCB_I2C_PORT_DEFAULT = 0;
 
 /*
  The legacy I2C driver used addresses to differentiate between devices, whereas the new driver uses
- i2c_master_dev_handle_t structs which are registed to the bus.
- To avoid re-writing all camera dependant code, we simply translate the devices address to the corresponding
+ i2c_master_dev_handle_t structs which are registered to the bus.
+ To avoid re-writing all camera dependent code, we simply translate the devices address to the corresponding
  device_handle. This keeps all interfaces to the drivers identical.
  To perform this conversion the following local struct is used.
 */
@@ -152,7 +155,7 @@ int SCCB_Use_Port(int i2c_num)
         return ESP_ERR_INVALID_ARG;
     }
     sccb_i2c_port = i2c_num;
-
+    sccb_owns_i2c_port = false; // in this case, camera doesn't own the i2c port
     return ESP_OK;
 }
 
@@ -225,17 +228,22 @@ uint8_t SCCB_Read(uint8_t slv_addr, uint8_t reg)
     i2c_master_dev_handle_t dev_handle = *(get_handle_from_address(slv_addr));
 
     uint8_t tx_buffer[1];
-    uint8_t rx_buffer[1];
+    uint8_t rx_buffer[1] = {0};
 
     tx_buffer[0] = reg;
 
-    esp_err_t ret = i2c_master_transmit_receive(dev_handle, tx_buffer, 1, rx_buffer, 1, TIMEOUT_MS);
+    esp_err_t ret = i2c_master_transmit(dev_handle, tx_buffer, 1, TIMEOUT_MS);
 
-    if (ret != ESP_OK)
-    {
-        ESP_LOGE(TAG, "SCCB_Read Failed addr:0x%02x, reg:0x%02x, data:0x%02x, ret:%d", slv_addr, reg, rx_buffer[0], ret);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SCCB_Read addr phase failed addr:0x%02x, reg:0x%02x, ret:%d", slv_addr, reg, ret);
+        return 0;
     }
 
+    ret = i2c_master_receive(dev_handle, rx_buffer, 1, TIMEOUT_MS);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "SCCB_Read Failed addr:0x%02x, reg:0x%02x, ret:%d", slv_addr, reg, ret);
+    }
+    ESP_LOGD(TAG, "read OK");
     return rx_buffer[0];
 }
 

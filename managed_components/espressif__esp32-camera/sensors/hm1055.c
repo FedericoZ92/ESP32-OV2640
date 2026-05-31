@@ -253,7 +253,7 @@ static int set_framesize(sensor_t *sensor, framesize_t framesize)
     }
     else
     {
-        ESP_LOGD(TAG, "Dont suppost this size, Set FRAMESIZE_VGA");
+        ESP_LOGD(TAG, "Dont support this size, Set FRAMESIZE_VGA");
         ret = write_regs(sensor->slv_addr, sensor_framesize_VGA);
     }
 
@@ -772,7 +772,7 @@ static int init_status(sensor_t *sensor)
     return 0;
 }
 
-int hm1055_detect(int slv_addr, sensor_id_t *id)
+int esp32_camera_hm1055_detect(int slv_addr, sensor_id_t *id)
 {
     if (HM1055_SCCB_ADDR == slv_addr)
     {
@@ -792,7 +792,7 @@ int hm1055_detect(int slv_addr, sensor_id_t *id)
     return 0;
 }
 
-int hm1055_init(sensor_t *sensor)
+int esp32_camera_hm1055_init(sensor_t *sensor)
 {
     sensor->reset = reset;
     sensor->set_pixformat = set_pixformat;
@@ -828,5 +828,14 @@ int hm1055_init(sensor_t *sensor)
     sensor->set_res_raw = set_res_raw;
     sensor->set_pll = _set_pll;
     sensor->set_xclk = set_xclk;
+
+    // No autofocus support
+    sensor->af_is_supported = NULL;
+    sensor->af_init = NULL;
+    sensor->af_set_mode = NULL;
+    sensor->af_trigger = NULL;
+    sensor->af_get_status = NULL;
+    sensor->af_set_manual_position = NULL;
+
     return 0;
 }
