@@ -286,15 +286,36 @@ extern "C" void app_main(void)
         return;
     }
 
-    server.setCaptureHandler(captureRgbCallback);
-    if (server.start() == ESP_OK) {
-        ESP_LOGI(OV2640_TAG, "HTTP Server started. Open http://%s/capture.jpg", wifi.getLocalIP().c_str());
-    } else {
-        ESP_LOGE(OV2640_TAG, "HTTP Server not started");
-    }
+    // HTTP server task 
+    auto http_server_task = [](void* arg) {
+        server.setCaptureHandler(captureRgbCallback);
+        if (server.start() == ESP_OK) {
+            ESP_LOGI(OV2640_TAG, "HTTP Server started. Open http://%s/capture.jpg", wifi.getLocalIP().c_str());
+        } else {
+            ESP_LOGE(OV2640_TAG, "HTTP Server not started");
+        }
+        vTaskDelete(NULL); // Clean up task after starting server
+    };
+
+    // Pass the lambda directly to FreeRTOS
+    xTaskCreatePinnedToCore(
+        http_server_task,     // The compiler automatically converts this to a function pointer
+        "http_server_task",
+        4096,
+        NULL,                 // Pass NULL since your lambda doesn't use the 'arg' parameter
+        5,
+        NULL,
+        0                     // Pin to core 0 
+    );
 
     // --- Start capture task ---
-    xTaskCreate(capture_task, "capture_task", 4096, nullptr, 5, nullptr);
+    xTaskCreatePinnedToCore(capture_task, 
+                            "capture_task", 
+                            4096, 
+                            NULL, 
+                            5, 
+                            NULL, 
+                            1); //xCoreID 0 for main core, 1 for app core
     ESP_LOGI(OV2640_TAG, "Started periodic capture task");
 
     // --- Optional: run for a limited time, then reboot ---
