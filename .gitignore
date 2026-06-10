@@ -22,4 +22,6 @@ sdkconfig
 ./builds/
 builds/
 /builds*/
+.cache/
+.cache/clangd/
 **/network.h
