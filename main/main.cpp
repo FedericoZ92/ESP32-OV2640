@@ -45,30 +45,32 @@ CheckpointTimer tensorFlowTimer;
 CheckpointTimer httpTimer;
 
 // --- Shared static frame buffer ---
-static uint8_t *latestFrameForHttpUploading = (uint8_t*) heap_caps_malloc(JPEG_BUFFER_SIZE, MALLOC_CAP_SPIRAM);;
-static SemaphoreHandle_t frame_mutex = nullptr;
+static uint8_t* httpFrameBuffers[2] = {nullptr, nullptr};
+static volatile uint8_t activeHttpFrameIndex = 0;
+static volatile size_t activeHttpFrameLen = 0;
+static portMUX_TYPE httpFrameMetaLock = portMUX_INITIALIZER_UNLOCKED;
 static TfLiteWrapper tf_wrapper;
-static size_t latestFrameForHttpUploading_len = 0; // store size of latest JPEG frame
 uint8_t *rawImageBuffer = nullptr; // raw pixels
 uint8_t* tflitePreEditingBuffer = nullptr; // default: raw buffer
 static uint8_t tfliteGray96x96InputBuffer[TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE];
 
-// Background task: capture a new frame every 10 seconds
+// Background task: capture and process frames continuously
 void capture_task(void *arg)
 {
     ESP_LOGI(CAPTURE_TAG, "Camera capture task started");
     static uint8_t processedFrame[TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE];
-    const size_t jpegBufferSize = JPEG_BUFFER_SIZE;
-    latestFrameForHttpUploading = (uint8_t*) heap_caps_malloc(jpegBufferSize, MALLOC_CAP_SPIRAM);
-    if (!latestFrameForHttpUploading) {
+    const size_t frameBufferSize = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE;
+    httpFrameBuffers[0] = (uint8_t*) heap_caps_malloc(frameBufferSize, MALLOC_CAP_SPIRAM);
+    httpFrameBuffers[1] = (uint8_t*) heap_caps_malloc(frameBufferSize, MALLOC_CAP_SPIRAM);
+    if (!httpFrameBuffers[0] || !httpFrameBuffers[1]) {
         ESP_LOGE(CAPTURE_TAG, "Failed to allocate PSRAM buffer for JPEG frames!");
         return;
     }
-    latestFrameForHttpUploading_len = 0;
+    activeHttpFrameLen = 0;
 
     while (true) {
         // --- Handle JPEG decoding or raw frame ---
-        ESP_LOGI(CAPTURE_TAG, "Handle JPEG decoding or raw frame, mark checkpoint"); 
+        ESP_LOGD(CAPTURE_TAG, "Handle JPEG decoding or raw frame, mark checkpoint"); 
         cameraAcquisitionTimer.checkpoint();
         camera_fb_t *frameBuffer = esp_camera_fb_get();
         if (!frameBuffer) {
@@ -76,13 +78,13 @@ void capture_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
-        ESP_LOGI(CAPTURE_TAG, "Frame: %dx%d, len=%d, format=%d", frameBuffer->width, frameBuffer->height, frameBuffer->len, frameBuffer->format);
+        ESP_LOGD(CAPTURE_TAG, "Frame: %dx%d, len=%d, format=%d", frameBuffer->width, frameBuffer->height, frameBuffer->len, frameBuffer->format);
         cameraAcquisitionTimer.logCheckpoint(CAPTURE_TAG, "frame captured");
     
         // ---
 
         // --- Handle JPEG decoding to raw frame ---
-        ESP_LOGI(CAPTURE_TAG, "Handle JPEG decoding to raw frame"); 
+        ESP_LOGD(CAPTURE_TAG, "Handle JPEG decoding to raw frame"); 
         jpegTimer.checkpoint();
         // Free previous decoded buffer
         if (rawImageBuffer) {
@@ -112,7 +114,7 @@ void capture_task(void *arg)
         // ---
 
         // --- TensorFlow Lite inference ---
-        ESP_LOGI(CAPTURE_TAG, "TensorFlow Lite inference"); 
+        ESP_LOGD(CAPTURE_TAG, "TensorFlow Lite inference"); 
         tensorFlowTimer.checkpoint();
         if (frameBuffer->width >= TF_IMAGE_INPUT_SIZE && frameBuffer->height >= TF_IMAGE_INPUT_SIZE) {
             int channels = (frameBuffer->format == PIXFORMAT_RGB565 || frameBuffer->format == PIXFORMAT_RGB888) ? 3 : 1;
@@ -134,6 +136,19 @@ void capture_task(void *arg)
 
                 memcpy(tfliteGray96x96InputBuffer, processedFrame, TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE);
             }
+
+            
+            // Publish latest grayscale frame first so HTTP is not blocked by inference latency.
+            const int gray_size = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE; // 96x96
+            uint8_t publishIndex = activeHttpFrameIndex ^ 1;
+            if (httpFrameBuffers[publishIndex]) {
+                memcpy(httpFrameBuffers[publishIndex], tfliteGray96x96InputBuffer, gray_size);
+                taskENTER_CRITICAL(&httpFrameMetaLock);
+                activeHttpFrameLen = gray_size;
+                activeHttpFrameIndex = publishIndex;
+                taskEXIT_CRITICAL(&httpFrameMetaLock);
+            }
+
             // Run inference
             TfLiteTensor* input = tf_wrapper.getInputTensor();
             if (input && input->dims && input->dims->size >= 4) {
@@ -158,58 +173,39 @@ void capture_task(void *arg)
         tensorFlowTimer.logCheckpoint(TF_TAG, "tf inference done");
         // ---
 
-        // --- Copy processed grayscale buffer for HTTP server ---
-        ESP_LOGI(CAPTURE_TAG, "Copy processed frame for HTTP server, IP: %s", wifi.getLocalIP().c_str());
-        httpTimer.checkpoint();
-
-        // Copy grayscale buffer directly (1 byte per pixel) to HTTP upload buffer
-        const int gray_size = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE; // 96x96
-        if (xSemaphoreTake(frame_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            if (gray_size <= JPEG_BUFFER_SIZE) {
-                memcpy(latestFrameForHttpUploading, tfliteGray96x96InputBuffer, gray_size);
-                latestFrameForHttpUploading_len = gray_size;
-            } else {
-                ESP_LOGW(CAPTURE_TAG, "Processed grayscale frame too large for HTTP buffer! len=%d", gray_size);
-            }
-            xSemaphoreGive(frame_mutex);
-        } else {
-            ESP_LOGW(CAPTURE_TAG, "Failed to acquire frame mutex for HTTP frame");
-        }
-
-        httpTimer.logCheckpoint(HTTP_TAG, "frame uploading done");
-        // ---
-
         esp_camera_fb_return(frameBuffer);
 
-        ESP_LOGI(CAPTURE_TAG, "Wait 1s"); 
+        // Yield to networking/HTTP tasks to avoid burst-and-freeze behavior.
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
 // HTTP handler — returns the latest captured grayscale frame
 esp_err_t captureRgbCallback(httpd_req_t *req)
 {
-    if (xSemaphoreTake(frame_mutex, pdMS_TO_TICKS(500)) == pdTRUE) {
-        httpd_resp_set_type(req, "application/octet-stream");
+    httpd_resp_set_type(req, "application/octet-stream");
 
-        if (latestFrameForHttpUploading_len > 0) {
-            httpd_resp_send(req, (const char*)latestFrameForHttpUploading, latestFrameForHttpUploading_len);
-        } else {
-            // send a blank frame
-            static uint8_t blank[TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE] = {0};
-            httpd_resp_send(req, (const char*)blank, sizeof(blank));
-        }
+    size_t frameLen = 0;
+    uint8_t frameIndex = 0;
+    taskENTER_CRITICAL(&httpFrameMetaLock);
+    frameLen = activeHttpFrameLen;
+    frameIndex = activeHttpFrameIndex;
+    taskEXIT_CRITICAL(&httpFrameMetaLock);
 
-        xSemaphoreGive(frame_mutex);
-        return ESP_OK;
+    if (frameLen > 0 && httpFrameBuffers[frameIndex]) {
+        httpd_resp_send(req, (const char*)httpFrameBuffers[frameIndex], frameLen);
     } else {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Failed to acquire mutex");
-        return ESP_FAIL;
+        // Send a blank frame until the first capture is published.
+        static uint8_t blank[TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE] = {0};
+        httpd_resp_send(req, (const char*)blank, sizeof(blank));
     }
+
+    return ESP_OK;
 }
 
 extern "C" void app_main(void)
 {
-    esp_log_level_set("*", ESP_LOG_VERBOSE);
+    esp_log_level_set("*", ESP_LOG_INFO);
 
     // --- Print chip info ---
     esp_chip_info_t chip_info;
@@ -279,13 +275,6 @@ extern "C" void app_main(void)
         ESP_LOGI(OV2640_TAG, "Camera image flipped 180°");
     } else {
         ESP_LOGW(OV2640_TAG, "Failed to get camera sensor handle for flipping");
-    }
-
-    // --- HTTP server setup ---
-    frame_mutex = xSemaphoreCreateMutex();
-    if (!frame_mutex) {
-        ESP_LOGE(OV2640_TAG, "Failed to create frame mutex");
-        return;
     }
 
     // HTTP server task 

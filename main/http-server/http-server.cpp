@@ -25,10 +25,21 @@ static const char *INDEX_HTML = R"rawliteral(
     const width = 96;
     const height = 96;
     const imageData = ctx.createImageData(width, height);
+    const targetPeriodMs = 250;
+    const minDelayMs = 40;
 
     async function fetchFrame() {
+      const t0 = performance.now();
       try {
-        const response = await fetch('/capture.rgb');
+        const response = await fetch(`/capture.rgb?ts=${Date.now()}`, { cache: 'no-store' });
+        if (response.status === 204) {
+          return;
+        }
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+
         const buffer = await response.arrayBuffer();
         const gray = new Uint8Array(buffer);
 
@@ -44,7 +55,9 @@ static const char *INDEX_HTML = R"rawliteral(
       } catch (err) {
         console.error(err);
       } finally {
-        setTimeout(fetchFrame, 1000); // next frame in 1000ms
+        const elapsedMs = performance.now() - t0;
+        const nextDelayMs = Math.max(minDelayMs, targetPeriodMs - elapsedMs);
+        setTimeout(fetchFrame, nextDelayMs);
       }
     }
 
