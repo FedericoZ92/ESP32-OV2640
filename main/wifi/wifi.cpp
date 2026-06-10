@@ -54,7 +54,6 @@ esp_err_t WifiManager::initAP(const std::string &ssid,
 
     ESP_LOGI(OV2640_TAG, "Wi-Fi AP started. SSID: %s, PASS: %s", ssid.c_str(),
              password.empty() ? "<open>" : password.c_str());
-    ESP_LOGI(OV2640_TAG, "Access Point IP: 192.168.4.1");
 
     return ESP_OK;
 }

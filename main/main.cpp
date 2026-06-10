@@ -182,7 +182,6 @@ void capture_task(void *arg)
         esp_camera_fb_return(frameBuffer);
 
         ESP_LOGI(CAPTURE_TAG, "Wait 1s"); 
-        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
