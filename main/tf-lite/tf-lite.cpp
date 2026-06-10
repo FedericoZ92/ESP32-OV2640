@@ -7,14 +7,16 @@
 #include "esp_system.h"
 #include "debug.h"
 
-TfLiteWrapper::TfLiteWrapper(const unsigned char* model_data, size_t arena_size_, uint8_t* arena_buffer)
-: model(nullptr), interpreter(nullptr), tensor_arena(arena_buffer), arena_size(arena_size_)
+bool TfLiteWrapper::init(const unsigned char* model_data, size_t arena_size_, uint8_t* arena_buffer)
 {
+    tensor_arena = arena_buffer;
+    arena_size = arena_size_;
+
     // Map model
     model = tflite::GetModel(model_data);
     if (model->version() != TFLITE_SCHEMA_VERSION) {
         ESP_LOGE(TF_TAG, "Model schema version mismatch!");
-        return;
+        return false;
     }
 
     // Add only the ops your model uses
@@ -31,11 +33,6 @@ TfLiteWrapper::TfLiteWrapper(const unsigned char* model_data, size_t arena_size_
     resolver.AddRelu6();
 
     // Allocate tensor arena
-    // Need to allocate enough RAM for the tensor arena, which holds:
-    //- Input/output tensors
-    //- Intermediate tensors
-    //- Scratch buffers
-    //- Activations
     ESP_LOGD(TF_TAG, "Largest allocatable block: %d", heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     ESP_LOGD(TF_TAG, "Free heap before arena allocation: %d, arena size: %d", (int)esp_get_free_heap_size(), (int)arena_size);
 
@@ -45,20 +42,22 @@ TfLiteWrapper::TfLiteWrapper(const unsigned char* model_data, size_t arena_size_
         tensor_arena = (uint8_t*)heap_caps_malloc(arena_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         if (!tensor_arena) {
             ESP_LOGE(TF_TAG, "Failed to allocate tensor arena!");
-            return;
+            return false;
         }
     }
 
-    // Create interpreter
-    static tflite::MicroInterpreter static_interpreter(
+    // Create interpreter via placement new — lives in this object's storage
+    interpreter = new (interpreter_storage) tflite::MicroInterpreter(
         model, resolver, tensor_arena, arena_size);
-    interpreter = &static_interpreter;
 
     TfLiteStatus status = interpreter->AllocateTensors();
     if (status != kTfLiteOk) {
         ESP_LOGE(TF_TAG, "Tensor allocation failed, err: %d", (int)status);
         interpreter = nullptr;
+        return false;
     }
+
+    return true;
 }
 
 bool TfLiteWrapper::runInference(const uint8_t* image_data, int width, int height) 

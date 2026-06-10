@@ -254,9 +254,12 @@ extern "C" void app_main(void)
     }
 
     // --- Initialize TensorFlow Lite wrapper using allocated arena ---
-    tf_wrapper = TfLiteWrapper(g_person_detect_model_data, arena_size, tensor_arena);
+    if (!tf_wrapper.init(g_person_detect_model_data, arena_size, tensor_arena)) {
+        ESP_LOGE(TF_TAG, "TfLite initialization failed!");
+        return;
+    }
 
-    log_RAM_status("pre Wi-Fi initialization");
+    log_RAM_status("pre Wi-Fi initialization"); // TODO restore
 
     // --- Wi-Fi initialization ---
     wifi.init();
