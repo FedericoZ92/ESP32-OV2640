@@ -21,6 +21,7 @@
 #include "network.h"
 #include "checkpoint-timer/checkpoint-timer.h"
 #include "util/misc.h"
+#include "define.h"
 
 // OV2640 pin map for ESP32-S3-CAM-N16R8
 // https://www.oceanlabz.in/getting-started-with-esp32-s3-wroom-n16r8-cam-dev-board/?srsltid=AfmBOors-1xeo_-CM5mcneEFHgQY9ps0qX2SHt8gf-S7Ndizot0T4vzk
@@ -29,10 +30,6 @@
 // https://www.fruugo.it/esp32-s3-wroom-n16r8-modulo-fotocamera-per-scheda-di-sviluppo-cam-con-ov2640/p-358759907-780375612?language=it&ac=google&utm_source=google&utm_medium=paid&gad_source=1&gad_campaignid=22510258486&gbraid=0AAAAADpXug2uMu5_YIv6BL_H9NJZ76oa1&gclid=EAIaIQobChMI8brdxtT0kQMVuZqDBx1AHgjiEAQYASABEgI-qPD_BwE
 
 // camera parameters in camera-driver.cpp!
-
-#define JPEG_BUFFER_SIZE 20 * 1024 // FRAMESIZE_QQVGA: 160x120
-#define ARENA_SIZE 128 * 1024;
-#define STREAM_KEEP_OPEN 1
 
 CameraHttpServer server;
 WifiManager wifi;
@@ -151,6 +148,7 @@ void capture_task(void *arg)
             }
 
             // Run inference
+#if ENABLE_INFERENCE
             TfLiteTensor* input = tf_wrapper.getInputTensor();
             if (input && input->dims && input->dims->size >= 4) {
                 logFirstPixels(TF_TAG, "tfliteGray96x96InputBuffer", tfliteGray96x96InputBuffer, 10);
@@ -168,6 +166,7 @@ void capture_task(void *arg)
             } else {
                 ESP_LOGE(TF_TAG, "Input tensor is null or malformed");
             }
+#endif
         } else {
             ESP_LOGW(CAPTURE_TAG, "Frame too small to resize to 96x96");
         }
@@ -290,8 +289,9 @@ extern "C" void app_main(void)
     vTaskDelay(pdMS_TO_TICKS(100));
 
     // --- Allocate TensorFlow Lite arena intelligently ---
+#if ENABLE_INFERENCE
     uint8_t* tensor_arena = nullptr;
-    const size_t arena_size = ARENA_SIZE; 
+    const size_t arena_size = ARENA_SIZE;
     if (!tensor_arena) {
         ESP_LOGW(TF_TAG, "Internal RAM low, allocating arena in PSRAM");
         tensor_arena = (uint8_t*) heap_caps_malloc(arena_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -306,6 +306,9 @@ extern "C" void app_main(void)
         ESP_LOGE(TF_TAG, "TfLite initialization failed!");
         return;
     }
+#else
+    ESP_LOGW(TF_TAG, "Inference disabled for test build (ENABLE_INFERENCE=0)");
+#endif
 
     log_RAM_status("pre Wi-Fi initialization"); // TODO restore
 

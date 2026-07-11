@@ -1,12 +1,5 @@
 #include "http-server/http-server.h"
-
-#define ENABLE_POLLING_FALLBACK 0
-
-#if ENABLE_POLLING_FALLBACK
-#define ENABLE_POLLING_FALLBACK_JS "true"
-#else
-#define ENABLE_POLLING_FALLBACK_JS "false"
-#endif
+#include "define.h"
 
 CameraHttpServer::CaptureCallback CameraHttpServer::s_captureCallback = nullptr;
 CameraHttpServer::StreamCallback CameraHttpServer::s_streamCallback = nullptr;
