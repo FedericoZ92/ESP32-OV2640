@@ -203,6 +203,46 @@ esp_err_t captureRgbCallback(httpd_req_t *req)
     return ESP_OK;
 }
 
+// HTTP handler — keeps one connection open and streams grayscale frames.
+esp_err_t streamRgbCallback(httpd_req_t *req)
+{
+    static constexpr size_t frameSize = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE;
+    static uint8_t blank[frameSize] = {0};
+    static constexpr int maxFramesPerRequest = 8;
+
+    httpd_resp_set_type(req, "application/octet-stream");
+    httpd_resp_set_hdr(req, "Connection", "close");
+
+    for (int frameCount = 0; frameCount < maxFramesPerRequest; ++frameCount) {
+        size_t frameLen = 0;
+        uint8_t frameIndex = 0;
+
+        taskENTER_CRITICAL(&httpFrameMetaLock);
+        frameLen = activeHttpFrameLen;
+        frameIndex = activeHttpFrameIndex;
+        taskEXIT_CRITICAL(&httpFrameMetaLock);
+
+        const uint8_t *framePtr = nullptr;
+        size_t sendLen = frameSize;
+        if (frameLen >= frameSize && httpFrameBuffers[frameIndex]) {
+            framePtr = httpFrameBuffers[frameIndex];
+        } else {
+            framePtr = blank;
+        }
+
+        esp_err_t err = httpd_resp_send_chunk(req, (const char*)framePtr, sendLen);
+        if (err != ESP_OK) {
+            return err;
+        }
+
+        // Keep stream near the page's target refresh rate.
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+
+    // End this chunked response so the browser reconnect loop can continue.
+    return httpd_resp_send_chunk(req, nullptr, 0);
+}
+
 extern "C" void app_main(void)
 {
     esp_log_level_set("*", ESP_LOG_INFO);
@@ -280,8 +320,9 @@ extern "C" void app_main(void)
     // HTTP server task 
     auto http_server_task = [](void* arg) {
         server.setCaptureHandler(captureRgbCallback);
+        server.setStreamHandler(streamRgbCallback);
         if (server.start() == ESP_OK) {
-            ESP_LOGI(OV2640_TAG, "HTTP Server started. Open http://%s/capture.jpg", wifi.getLocalIP().c_str());
+            ESP_LOGI(OV2640_TAG, "HTTP Server started. Open http://%s/", wifi.getLocalIP().c_str());
         } else {
             ESP_LOGE(OV2640_TAG, "HTTP Server not started");
         }

@@ -8,6 +8,7 @@
 class CameraHttpServer {
 public:
     using CaptureCallback = std::function<esp_err_t(httpd_req_t *req)>;
+    using StreamCallback = std::function<esp_err_t(httpd_req_t *req)>;
 
     CameraHttpServer();
     ~CameraHttpServer();
@@ -16,6 +17,7 @@ public:
     void stop();
 
     void setCaptureHandler(CaptureCallback callback);
+    void setStreamHandler(StreamCallback callback);
 
 private:
     static esp_err_t handleCapture(httpd_req_t *req);
@@ -24,5 +26,6 @@ private:
     static inline const char *TAG = "CameraHttpServer";
 
     static CaptureCallback s_captureCallback;
+    static StreamCallback s_streamCallback;
     httpd_handle_t serverHandle = nullptr;
 };
