@@ -32,6 +32,7 @@
 
 #define JPEG_BUFFER_SIZE 20 * 1024 // FRAMESIZE_QQVGA: 160x120
 #define ARENA_SIZE 128 * 1024;
+#define STREAM_KEEP_OPEN 1
 
 CameraHttpServer server;
 WifiManager wifi;
@@ -208,12 +209,19 @@ esp_err_t streamRgbCallback(httpd_req_t *req)
 {
     static constexpr size_t frameSize = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE;
     static uint8_t blank[frameSize] = {0};
+#if !STREAM_KEEP_OPEN
     static constexpr int maxFramesPerRequest = 8;
+#endif
 
     httpd_resp_set_type(req, "application/octet-stream");
+ 
+#if STREAM_KEEP_OPEN
+    httpd_resp_set_hdr(req, "Connection", "keep-alive");
+    while (true) {
+#else
     httpd_resp_set_hdr(req, "Connection", "close");
-
     for (int frameCount = 0; frameCount < maxFramesPerRequest; ++frameCount) {
+#endif
         size_t frameLen = 0;
         uint8_t frameIndex = 0;
 
@@ -239,8 +247,13 @@ esp_err_t streamRgbCallback(httpd_req_t *req)
         vTaskDelay(pdMS_TO_TICKS(250));
     }
 
+#if STREAM_KEEP_OPEN
+    // Keep-open mode exits only if send_chunk fails and returns above.
+    return ESP_OK;
+#else
     // End this chunked response so the browser reconnect loop can continue.
     return httpd_resp_send_chunk(req, nullptr, 0);
+#endif
 }
 
 extern "C" void app_main(void)
