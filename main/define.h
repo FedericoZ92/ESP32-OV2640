@@ -8,7 +8,7 @@
 
 // Keep /stream.rgb connection open indefinitely when set to 1.
 // Set to 0 to stream a limited burst and reconnect.
-#define STREAM_KEEP_OPEN 0
+#define STREAM_KEEP_OPEN 1
 
 // Enable TensorFlow inference path in capture_task when set to 1.
 // Set to 0 to suspend inference for streaming performance tests.
@@ -19,7 +19,7 @@
 
 // JavaScript-compatible boolean string derived from ENABLE_POLLING_FALLBACK.
 #if ENABLE_POLLING_FALLBACK
-#define ENABLE_POLLING_FALLBACK_JS "true"
+    #define ENABLE_POLLING_FALLBACK_JS "true"
 #else
-#define ENABLE_POLLING_FALLBACK_JS "false"
+    #define ENABLE_POLLING_FALLBACK_JS "false"
 #endif

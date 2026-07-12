@@ -6,6 +6,7 @@
 #include <esp_log.h>
 #include <esp_chip_info.h>
 #include <esp_flash.h>
+#include <esp_timer.h>
 #include <esp_camera.h>
 #include "camera-driver/camera-driver.h"
 #include "http-server/http-server.h"
@@ -46,6 +47,8 @@ CheckpointTimer httpTimer;
 static uint8_t* httpFrameBuffers[2] = {nullptr, nullptr};
 static volatile uint8_t activeHttpFrameIndex = 0;
 static volatile size_t activeHttpFrameLen = 0;
+static volatile uint32_t activeHttpFrameSeq = 0;
+static volatile int64_t activeHttpFramePublishUs = 0;
 static portMUX_TYPE httpFrameMetaLock = portMUX_INITIALIZER_UNLOCKED;
 static TfLiteWrapper tf_wrapper;
 uint8_t *rawImageBuffer = nullptr; // raw pixels
@@ -56,6 +59,8 @@ static uint8_t tfliteGray96x96InputBuffer[TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_S
 void capture_task(void *arg)
 {
     ESP_LOGI(CAPTURE_TAG, "Camera capture task started");
+    uint32_t producedFrames = 0;
+    int64_t producerWindowStartUs = esp_timer_get_time();
     static uint8_t processedFrame[TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE];
     const size_t frameBufferSize = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE;
     httpFrameBuffers[0] = (uint8_t*) heap_caps_malloc(frameBufferSize, MALLOC_CAP_SPIRAM);
@@ -135,38 +140,53 @@ void capture_task(void *arg)
                 memcpy(tfliteGray96x96InputBuffer, processedFrame, TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE);
             }
 
-            
             // Publish latest grayscale frame first so HTTP is not blocked by inference latency.
             const int gray_size = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE; // 96x96
             uint8_t publishIndex = activeHttpFrameIndex ^ 1;
             if (httpFrameBuffers[publishIndex]) {
                 memcpy(httpFrameBuffers[publishIndex], tfliteGray96x96InputBuffer, gray_size);
+                const int64_t nowUs = esp_timer_get_time();
                 taskENTER_CRITICAL(&httpFrameMetaLock);
                 activeHttpFrameLen = gray_size;
                 activeHttpFrameIndex = publishIndex;
+                activeHttpFrameSeq++;
+                activeHttpFramePublishUs = nowUs;
                 taskEXIT_CRITICAL(&httpFrameMetaLock);
+
+                producedFrames++;
+                const int64_t elapsedUs = nowUs - producerWindowStartUs;
+                if (elapsedUs >= 2000000) {
+                    const float producerFps = (producedFrames * 1000000.0f) / (float)elapsedUs;
+                    ESP_LOGI(CAPTURE_TAG, "Producer FPS: %.2f | latest seq=%lu | frame=%dx%d fmt=%d len=%d",
+                             producerFps,
+                             (unsigned long)activeHttpFrameSeq,
+                             frameBuffer->width,
+                             frameBuffer->height,
+                             frameBuffer->format,
+                             frameBuffer->len);
+                    producedFrames = 0;
+                    producerWindowStartUs = nowUs;
+                }
             }
 
             // Run inference
-#if ENABLE_INFERENCE
-            TfLiteTensor* input = tf_wrapper.getInputTensor();
-            if (input && input->dims && input->dims->size >= 4) {
-                logFirstPixels(TF_TAG, "tfliteGray96x96InputBuffer", tfliteGray96x96InputBuffer, 10);
-                bool person_present = tf_wrapper.runInference(tfliteGray96x96InputBuffer, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE);
-                ESP_LOGW(TF_TAG, "Person detected? %s", person_present ? "YES" : "NO");
-                if (person_present) {
-                    redLed.setLedGpio2(0);
-                    rgb.turnBlueLedOn(); // blue
-
+            #if ENABLE_INFERENCE
+                TfLiteTensor* input = tf_wrapper.getInputTensor();
+                if (input && input->dims && input->dims->size >= 4) {
+                    logFirstPixels(TF_TAG, "tfliteGray96x96InputBuffer", tfliteGray96x96InputBuffer, 10);
+                    bool person_present = tf_wrapper.runInference(tfliteGray96x96InputBuffer, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE);
+                    ESP_LOGW(TF_TAG, "Person detected? %s", person_present ? "YES" : "NO");
+                    if (person_present) {
+                        redLed.setLedGpio2(0);
+                        rgb.turnBlueLedOn(); // blue
+                    } else {
+                        redLed.setLedGpio2(1);
+                        rgb.turnRedLedOn(); // red
+                    }
                 } else {
-                    redLed.setLedGpio2(1);
-                    rgb.turnRedLedOn(); // red
-
+                    ESP_LOGE(TF_TAG, "Input tensor is null or malformed");
                 }
-            } else {
-                ESP_LOGE(TF_TAG, "Input tensor is null or malformed");
-            }
-#endif
+            #endif
         } else {
             ESP_LOGW(CAPTURE_TAG, "Frame too small to resize to 96x96");
         }
@@ -183,24 +203,123 @@ void capture_task(void *arg)
 // HTTP handler — returns the latest captured grayscale frame
 esp_err_t captureRgbCallback(httpd_req_t *req)
 {
+    const int64_t reqStartUs = esp_timer_get_time();
     httpd_resp_set_type(req, "application/octet-stream");
 
     size_t frameLen = 0;
     uint8_t frameIndex = 0;
+    uint32_t frameSeq = 0;
+    int64_t framePublishUs = 0;
     taskENTER_CRITICAL(&httpFrameMetaLock);
     frameLen = activeHttpFrameLen;
     frameIndex = activeHttpFrameIndex;
+    frameSeq = activeHttpFrameSeq;
+    framePublishUs = activeHttpFramePublishUs;
     taskEXIT_CRITICAL(&httpFrameMetaLock);
 
+    // Expose frame telemetry in HTTP headers for browser-side diagnostics.
+    char seqBuf[16];
+    snprintf(seqBuf, sizeof(seqBuf), "%lu", (unsigned long)frameSeq);
+    httpd_resp_set_hdr(req, "X-Frame-Seq", seqBuf);
+
+    const int64_t nowUs = esp_timer_get_time();
+    const int64_t ageUs = (framePublishUs > 0 && nowUs > framePublishUs) ? (nowUs - framePublishUs) : 0;
+    char ageBuf[24];
+    snprintf(ageBuf, sizeof(ageBuf), "%lld", (long long)(ageUs / 1000));
+    httpd_resp_set_hdr(req, "X-Frame-Age-Ms", ageBuf);
+
+    char lenBuf[16];
+    snprintf(lenBuf, sizeof(lenBuf), "%u", (unsigned int)frameLen);
+    httpd_resp_set_hdr(req, "X-Frame-Len", lenBuf);
+
+    static uint32_t servedWindowCount = 0;
+    static uint32_t staleWindowCount = 0;
+    static uint32_t lastServedSeq = 0;
+    static int64_t servedWindowStartUs = 0;
+    if (servedWindowStartUs == 0) {
+        servedWindowStartUs = nowUs;
+    }
+
+    servedWindowCount++;
+    if (frameSeq == lastServedSeq && frameSeq != 0) {
+        staleWindowCount++;
+    }
+    lastServedSeq = frameSeq;
+
+    const int64_t servedElapsedUs = nowUs - servedWindowStartUs;
+    if (servedElapsedUs >= 2000000) {
+        const float servedFps = (servedWindowCount * 1000000.0f) / (float)servedElapsedUs;
+        ESP_LOGI("HTTP_CAPTURE", "Served FPS: %.2f | stale responses: %lu/%lu | seq=%lu | age_ms=%lld | len=%u",
+                 servedFps,
+                 (unsigned long)staleWindowCount,
+                 (unsigned long)servedWindowCount,
+                 (unsigned long)frameSeq,
+                 (long long)(ageUs / 1000),
+                 (unsigned int)frameLen);
+        servedWindowCount = 0;
+        staleWindowCount = 0;
+        servedWindowStartUs = nowUs;
+    }
+
+    const uint8_t *sendPtr = nullptr;
+    size_t sendLen = frameLen;
     if (frameLen > 0 && httpFrameBuffers[frameIndex]) {
-        httpd_resp_send(req, (const char*)httpFrameBuffers[frameIndex], frameLen);
+        sendPtr = httpFrameBuffers[frameIndex];
     } else {
         // Send a blank frame until the first capture is published.
         static uint8_t blank[TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE] = {0};
-        httpd_resp_send(req, (const char*)blank, sizeof(blank));
+        sendPtr = blank;
+        sendLen = sizeof(blank);
     }
 
-    return ESP_OK;
+    const int64_t sendStartUs = esp_timer_get_time();
+    esp_err_t sendErr = httpd_resp_send(req, (const char*)sendPtr, sendLen);
+    const int64_t sendEndUs = esp_timer_get_time();
+    const int64_t sendUs = (sendEndUs > sendStartUs) ? (sendEndUs - sendStartUs) : 0;
+    const int64_t reqTotalUs = (sendEndUs > reqStartUs) ? (sendEndUs - reqStartUs) : 0;
+
+    static uint32_t txWindowCount = 0;
+    static uint32_t txWindowErrCount = 0;
+    static int64_t txWindowStartUs = 0;
+    static int64_t txWindowSendSumUs = 0;
+    static int64_t txWindowReqSumUs = 0;
+    static int64_t txWindowSendMaxUs = 0;
+    if (txWindowStartUs == 0) {
+        txWindowStartUs = sendEndUs;
+    }
+
+    txWindowCount++;
+    txWindowSendSumUs += sendUs;
+    txWindowReqSumUs += reqTotalUs;
+    if (sendUs > txWindowSendMaxUs) {
+        txWindowSendMaxUs = sendUs;
+    }
+    if (sendErr != ESP_OK) {
+        txWindowErrCount++;
+    }
+
+    const int64_t txElapsedUs = sendEndUs - txWindowStartUs;
+    if (txElapsedUs >= 2000000) {
+        const float avgSendMs = (float)txWindowSendSumUs / (1000.0f * (float)txWindowCount);
+        const float avgReqMs = (float)txWindowReqSumUs / (1000.0f * (float)txWindowCount);
+        const float maxSendMs = (float)txWindowSendMaxUs / 1000.0f;
+        ESP_LOGI("HTTP_TX", "avg_send_ms=%.2f | max_send_ms=%.2f | avg_req_ms=%.2f | err=%lu/%lu | len=%u | seq=%lu",
+                 avgSendMs,
+                 maxSendMs,
+                 avgReqMs,
+                 (unsigned long)txWindowErrCount,
+                 (unsigned long)txWindowCount,
+                 (unsigned int)sendLen,
+                 (unsigned long)frameSeq);
+        txWindowCount = 0;
+        txWindowErrCount = 0;
+        txWindowSendSumUs = 0;
+        txWindowReqSumUs = 0;
+        txWindowSendMaxUs = 0;
+        txWindowStartUs = sendEndUs;
+    }
+
+    return sendErr;
 }
 
 // HTTP handler — keeps one connection open and streams grayscale frames.
@@ -208,51 +327,51 @@ esp_err_t streamRgbCallback(httpd_req_t *req)
 {
     static constexpr size_t frameSize = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE;
     static uint8_t blank[frameSize] = {0};
-#if !STREAM_KEEP_OPEN
-    static constexpr int maxFramesPerRequest = 8;
-#endif
+    #if !STREAM_KEEP_OPEN
+        static constexpr int maxFramesPerRequest = 8;
+    #endif
 
     httpd_resp_set_type(req, "application/octet-stream");
  
-#if STREAM_KEEP_OPEN
-    httpd_resp_set_hdr(req, "Connection", "keep-alive");
-    while (true) {
-#else
-    httpd_resp_set_hdr(req, "Connection", "close");
-    for (int frameCount = 0; frameCount < maxFramesPerRequest; ++frameCount) {
-#endif
-        size_t frameLen = 0;
-        uint8_t frameIndex = 0;
+    #if STREAM_KEEP_OPEN
+        httpd_resp_set_hdr(req, "Connection", "keep-alive");
+        while (true) {
+    #else
+        httpd_resp_set_hdr(req, "Connection", "close");
+        for (int frameCount = 0; frameCount < maxFramesPerRequest; ++frameCount) {
+    #endif
+            size_t frameLen = 0;
+            uint8_t frameIndex = 0;
 
-        taskENTER_CRITICAL(&httpFrameMetaLock);
-        frameLen = activeHttpFrameLen;
-        frameIndex = activeHttpFrameIndex;
-        taskEXIT_CRITICAL(&httpFrameMetaLock);
+            taskENTER_CRITICAL(&httpFrameMetaLock);
+            frameLen = activeHttpFrameLen;
+            frameIndex = activeHttpFrameIndex;
+            taskEXIT_CRITICAL(&httpFrameMetaLock);
 
-        const uint8_t *framePtr = nullptr;
-        size_t sendLen = frameSize;
-        if (frameLen >= frameSize && httpFrameBuffers[frameIndex]) {
-            framePtr = httpFrameBuffers[frameIndex];
-        } else {
-            framePtr = blank;
+            const uint8_t *framePtr = nullptr;
+            size_t sendLen = frameSize;
+            if (frameLen >= frameSize && httpFrameBuffers[frameIndex]) {
+                framePtr = httpFrameBuffers[frameIndex];
+            } else {
+                framePtr = blank;
+            }
+
+            esp_err_t err = httpd_resp_send_chunk(req, (const char*)framePtr, sendLen);
+            if (err != ESP_OK) {
+                return err;
+            }
+
+            // Keep stream near the page's target refresh rate.
+            vTaskDelay(pdMS_TO_TICKS(250));
         }
 
-        esp_err_t err = httpd_resp_send_chunk(req, (const char*)framePtr, sendLen);
-        if (err != ESP_OK) {
-            return err;
-        }
-
-        // Keep stream near the page's target refresh rate.
-        vTaskDelay(pdMS_TO_TICKS(250));
-    }
-
-#if STREAM_KEEP_OPEN
-    // Keep-open mode exits only if send_chunk fails and returns above.
-    return ESP_OK;
-#else
-    // End this chunked response so the browser reconnect loop can continue.
-    return httpd_resp_send_chunk(req, nullptr, 0);
-#endif
+    #if STREAM_KEEP_OPEN
+        // Keep-open mode exits only if send_chunk fails and returns above.
+        return ESP_OK;
+    #else
+        // End this chunked response so the browser reconnect loop can continue.
+        return httpd_resp_send_chunk(req, nullptr, 0);
+    #endif
 }
 
 extern "C" void app_main(void)
@@ -289,26 +408,26 @@ extern "C" void app_main(void)
     vTaskDelay(pdMS_TO_TICKS(100));
 
     // --- Allocate TensorFlow Lite arena intelligently ---
-#if ENABLE_INFERENCE
-    uint8_t* tensor_arena = nullptr;
-    const size_t arena_size = ARENA_SIZE;
-    if (!tensor_arena) {
-        ESP_LOGW(TF_TAG, "Internal RAM low, allocating arena in PSRAM");
-        tensor_arena = (uint8_t*) heap_caps_malloc(arena_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    }
-    if (!tensor_arena) {
-        ESP_LOGE(TF_TAG, "Failed to allocate tensor arena!");
-        return;
-    }
+    #if ENABLE_INFERENCE
+        uint8_t* tensor_arena = nullptr;
+        const size_t arena_size = ARENA_SIZE;
+        if (!tensor_arena) {
+            ESP_LOGW(TF_TAG, "Internal RAM low, allocating arena in PSRAM");
+            tensor_arena = (uint8_t*) heap_caps_malloc(arena_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        }
+        if (!tensor_arena) {
+            ESP_LOGE(TF_TAG, "Failed to allocate tensor arena!");
+            return;
+        }
 
-    // --- Initialize TensorFlow Lite wrapper using allocated arena ---
-    if (!tf_wrapper.init(g_person_detect_model_data, arena_size, tensor_arena)) {
-        ESP_LOGE(TF_TAG, "TfLite initialization failed!");
-        return;
-    }
-#else
-    ESP_LOGW(TF_TAG, "Inference disabled for test build (ENABLE_INFERENCE=0)");
-#endif
+        // --- Initialize TensorFlow Lite wrapper using allocated arena ---
+        if (!tf_wrapper.init(g_person_detect_model_data, arena_size, tensor_arena)) {
+            ESP_LOGE(TF_TAG, "TfLite initialization failed!");
+            return;
+        }
+    #else
+        ESP_LOGW(TF_TAG, "Inference disabled for test build (ENABLE_INFERENCE=0)");
+    #endif
 
     log_RAM_status("pre Wi-Fi initialization"); // TODO restore
 

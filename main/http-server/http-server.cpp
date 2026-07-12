@@ -1,5 +1,4 @@
 #include "http-server/http-server.h"
-#include "define.h"
 
 CameraHttpServer::CaptureCallback CameraHttpServer::s_captureCallback = nullptr;
 CameraHttpServer::StreamCallback CameraHttpServer::s_streamCallback = nullptr;
@@ -30,9 +29,18 @@ static const char *INDEX_HTML = R"rawliteral(
     const height = 96;
     const imageData = ctx.createImageData(width, height);
     const frameSize = width * height;
-    const compileEnablePollingFallback = )rawliteral" ENABLE_POLLING_FALLBACK_JS R"rawliteral(;
     let renderedFrames = 0;
-    let fallbackActive = false;
+    let errorCount = 0;
+    let staleFrames = 0;
+    let discardedFrames = 0;
+    let lastSeq = -1;
+    let lastAgeMs = 0;
+    let lastFetchMs = 0;
+    let lastDecodeMs = 0;
+    let lastDrawMs = 0;
+    let lastFrameLen = 0;
+    let lastFpsTime = performance.now();
+    let fpsFrames = 0;
 
     function drawGrayFrame(gray) {
       for (let i = 0; i < frameSize; i++) {
@@ -44,97 +52,65 @@ static const char *INDEX_HTML = R"rawliteral(
       }
       ctx.putImageData(imageData, 0, 0);
       renderedFrames++;
-      statusEl.textContent = `Frames: ${renderedFrames}`;
-    }
+      fpsFrames++;
 
-    function enablePollingFallback(reason) {
-      if (!compileEnablePollingFallback) {
-        console.warn('Polling fallback disabled at compile time:', reason);
-        statusEl.textContent = 'Stream mode only (fallback disabled)';
-        return;
+      const now = performance.now();
+      const elapsed = now - lastFpsTime;
+      if (elapsed >= 1000) {
+        const fps = (fpsFrames * 1000 / elapsed).toFixed(1);
+        statusEl.textContent = `Frames: ${renderedFrames} | FPS: ${fps} | stale: ${staleFrames} | discard: ${discardedFrames} | age: ${lastAgeMs}ms | net: ${lastFetchMs.toFixed(1)}ms | decode: ${lastDecodeMs.toFixed(1)}ms | draw: ${lastDrawMs.toFixed(1)}ms | len: ${lastFrameLen}`;
+        fpsFrames = 0;
+        lastFpsTime = now;
       }
-
-      if (fallbackActive) {
-        return;
-      }
-      fallbackActive = true;
-      console.warn('Switching to /capture.rgb polling:', reason);
-      statusEl.textContent = 'Using polling fallback...';
-      pollFrames();
     }
 
     async function pollFrames() {
       try {
+        const reqStart = performance.now();
         const response = await fetch(`/capture.rgb?ts=${Date.now()}`, { cache: 'no-store' });
+        const respReady = performance.now();
+        lastFetchMs = respReady - reqStart;
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}`);
         }
 
+        const seqHeader = response.headers.get('X-Frame-Seq');
+        const ageHeader = response.headers.get('X-Frame-Age-Ms');
+        const lenHeader = response.headers.get('X-Frame-Len');
+        const seq = seqHeader ? Number(seqHeader) : -1;
+        lastAgeMs = ageHeader ? Number(ageHeader) : 0;
+        lastFrameLen = lenHeader ? Number(lenHeader) : 0;
+        if (seq >= 0) {
+          if (lastSeq >= 0 && seq === lastSeq) {
+            staleFrames++;
+          }
+          lastSeq = seq;
+        }
+
+        const decodeStart = performance.now();
         const buffer = await response.arrayBuffer();
+        lastDecodeMs = performance.now() - decodeStart;
         const gray = new Uint8Array(buffer);
         if (gray.length >= frameSize) {
+          const drawStart = performance.now();
           drawGrayFrame(gray.subarray(0, frameSize));
+          lastDrawMs = performance.now() - drawStart;
+          errorCount = 0;
+        } else {
+          discardedFrames++;
+          throw new Error(`short frame: ${gray.length}`);
         }
       } catch (err) {
+        errorCount++;
         console.error(err);
-        statusEl.textContent = `Polling error: ${err.message}`;
+        statusEl.textContent = `Waiting for frames... (${errorCount})`;
       } finally {
-        setTimeout(pollFrames, 250);
+        setTimeout(pollFrames, 120);
       }
     }
 
-    async function streamFrames() {
-      try {
-        statusEl.textContent = 'Connecting stream...';
-        const response = await fetch('/stream.rgb', { cache: 'no-store' });
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
-        }
-
-        if (!response.body) {
-          throw new Error('Readable stream not available');
-        }
-
-        const reader = response.body.getReader();
-        let pending = new Uint8Array(0);
-
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) {
-            break;
-          }
-
-          const chunk = value || new Uint8Array(0);
-          const merged = new Uint8Array(pending.length + chunk.length);
-          merged.set(pending);
-          merged.set(chunk, pending.length);
-          pending = merged;
-
-          while (pending.length >= frameSize) {
-            const gray = pending.subarray(0, frameSize);
-            drawGrayFrame(gray);
-            pending = pending.subarray(frameSize);
-          }
-        }
-      } catch (err) {
-        console.error(err);
-        enablePollingFallback(err.message || 'stream failed');
-      } finally {
-        if (!fallbackActive) {
-          // Reconnect if stream closes.
-          setTimeout(streamFrames, 200);
-        }
-      }
-    }
-
-    // If no frame arrives quickly, switch to polling mode.
-    setTimeout(() => {
-      if (compileEnablePollingFallback && renderedFrames === 0) {
-        enablePollingFallback('no frames from stream');
-      }
-    }, 2000);
-
-    streamFrames();
+    statusEl.textContent = 'Connecting capture...';
+    pollFrames();
   </script>
 </body>
 </html>
