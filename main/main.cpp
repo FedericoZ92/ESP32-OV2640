@@ -63,9 +63,9 @@ uint8_t *rawImageBuffer = nullptr; // raw pixels
 uint8_t* tflitePreEditingBuffer = nullptr; // default: raw buffer
 static uint8_t tfliteGray96x96InputBuffer[TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE];
 
-// Large enough for QQVGA grayscale and typical QQVGA JPEG payloads.
+// Large enough for QQVGA grayscale and worst-case QQVGA JPEG payload bursts.
 static constexpr size_t kPublishedFrameMaxBytes =
-    (JPEG_BUFFER_SIZE > (160 * 120) ? JPEG_BUFFER_SIZE : (160 * 120));
+    (JPEG_BUFFER_SIZE > (160 * 120 * 2) ? JPEG_BUFFER_SIZE : (160 * 120 * 2));
 
 // Background task: capture and process frames continuously
 void capture_task(void *arg)

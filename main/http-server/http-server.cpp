@@ -150,12 +150,13 @@ static const char *INDEX_HTML = R"rawliteral(
         const ageHeader = response.headers.get('X-Frame-Age-Ms');
         const lenHeader = response.headers.get('X-Frame-Len');
         const formatHeader = response.headers.get('X-Frame-Format');
+        const contentType = response.headers.get('Content-Type') || '';
         const widthHeader = response.headers.get('X-Frame-Width');
         const heightHeader = response.headers.get('X-Frame-Height');
         const seq = seqHeader ? Number(seqHeader) : -1;
         lastAgeMs = ageHeader ? Number(ageHeader) : 0;
         lastFrameLen = lenHeader ? Number(lenHeader) : 0;
-        lastFrameFormat = formatHeader || 'gray8';
+        lastFrameFormat = formatHeader || (contentType.includes('image/jpeg') ? 'jpeg' : 'gray8');
         const frameWidth = widthHeader ? Number(widthHeader) : width;
         const frameHeight = heightHeader ? Number(heightHeader) : height;
         ensureCanvasSize(frameWidth, frameHeight);
@@ -168,12 +169,16 @@ static const char *INDEX_HTML = R"rawliteral(
 
         const decodeStart = performance.now();
         const buffer = await response.arrayBuffer();
-        if (lastFrameFormat === 'jpeg') {
+        const bytes = new Uint8Array(buffer);
+        const looksLikeJpeg = bytes.length >= 2 && bytes[0] === 0xFF && bytes[1] === 0xD8;
+        const treatAsJpeg = (lastFrameFormat === 'jpeg') || looksLikeJpeg;
+        if (treatAsJpeg) {
+          lastFrameFormat = 'jpeg';
           await drawJpegFrame(buffer);
           errorCount = 0;
         } else {
           lastDecodeMs = performance.now() - decodeStart;
-          const gray = new Uint8Array(buffer);
+          const gray = bytes;
           if (gray.length >= frameSize) {
             const drawStart = performance.now();
             drawGrayFrame(gray.subarray(0, frameSize));
@@ -187,7 +192,7 @@ static const char *INDEX_HTML = R"rawliteral(
       } catch (err) {
         errorCount++;
         console.error(err);
-        statusEl.textContent = `Waiting for frames... (${errorCount})`;
+        statusEl.textContent = `Waiting for frames... (${errorCount}) ${err && err.message ? err.message : ''}`;
       } finally {
         setTimeout(pollFrames, pollDelayMs);
       }
