@@ -715,30 +715,34 @@ extern "C" void app_main(void)
         ESP_LOGW(OV2640_TAG, "Failed to get camera sensor handle for flipping");
     }
 
-    #if USE_TCP
-        // HTTP server task
-        auto http_server_task = [](void* arg) {
+    // HTTP server task (always on; transport-specific handlers are configured below).
+    auto http_server_task = [](void* arg) {
+        #if USE_TCP
             server.setCaptureHandler(captureRgbCallback);
             server.setStreamHandler(streamRgbCallback);
-            if (server.start() == ESP_OK) {
-                ESP_LOGI(OV2640_TAG, "TCP mode active. HTTP server started at http://%s/", wifi.getLocalIP().c_str());
-            } else {
-                ESP_LOGE(OV2640_TAG, "HTTP server not started");
-            }
-            vTaskDelete(NULL); // Clean up task after starting server
-        };
+        #endif
 
-        // Pass the lambda directly to FreeRTOS
-        xTaskCreatePinnedToCore(
-            http_server_task,
-            "http_server_task",
-            4096,
-            NULL,
-            5,
-            NULL,
-            0
-        );
-    #endif
+        if (server.start() == ESP_OK) {
+            #if USE_TCP
+                ESP_LOGI(OV2640_TAG, "TCP mode active. HTTP server started at http://%s/", wifi.getLocalIP().c_str());
+            #else
+                ESP_LOGI(OV2640_TAG, "UDP mode active. HTTP status page available at http://%s/", wifi.getLocalIP().c_str());
+            #endif
+        } else {
+            ESP_LOGE(OV2640_TAG, "HTTP server not started");
+        }
+        vTaskDelete(NULL); // Clean up task after starting server
+    };
+
+    xTaskCreatePinnedToCore(
+        http_server_task,
+        "http_server_task",
+        4096,
+        NULL,
+        5,
+        NULL,
+        0
+    );
 
     #if USE_UDP
         ESP_LOGI(OV2640_TAG, "UDP mode active. Stream port: %d", UDP_STREAM_PORT);

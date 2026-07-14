@@ -1,4 +1,5 @@
 #include "http-server/http-server.h"
+#include "define.h"
 
 CameraHttpServer::CaptureCallback CameraHttpServer::s_captureCallback = nullptr;
 CameraHttpServer::StreamCallback CameraHttpServer::s_streamCallback = nullptr;
@@ -9,6 +10,42 @@ CameraHttpServer::~CameraHttpServer() { stop(); }
 // ============================
 // HTML page for live view using <canvas>
 // ============================
+#if USE_UDP
+static const char *INDEX_HTML = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ESP32 Camera Live View</title>
+</head>
+<body>
+  <h2>ESP32 Camera UDP Mode</h2>
+  <p id="status">UDP streaming is active. Browser preview is disabled in UDP mode.</p>
+  <p>Use a UDP receiver client on port 5001 and send a hello datagram first.</p>
+  <p>Tip: keep this page open for device status logs and controls.</p>
+  <label><input id="freezeToggle" type="checkbox"> Freeze capture (debug)</label>
+  <script>
+    const freezeToggle = document.getElementById('freezeToggle');
+    let lastFreeze = null;
+
+    async function syncFreeze() {
+      const freezeValue = freezeToggle.checked ? '1' : '0';
+      if (freezeValue === lastFreeze) {
+        return;
+      }
+      lastFreeze = freezeValue;
+      try {
+        await fetch(`/capture.rgb?ts=${Date.now()}&freeze=${freezeValue}`, { cache: 'no-store' });
+      } catch (_) {
+        // Ignore: in UDP mode this endpoint may be disabled depending on server wiring.
+      }
+    }
+
+    freezeToggle.addEventListener('change', syncFreeze);
+  </script>
+)rawliteral";
+#else
 static const char *INDEX_HTML = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -123,6 +160,7 @@ static const char *INDEX_HTML = R"rawliteral(
 </body>
 </html>
 )rawliteral";
+#endif
 
 // ============================
 // Start HTTP Server
