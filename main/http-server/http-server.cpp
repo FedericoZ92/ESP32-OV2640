@@ -268,6 +268,8 @@ esp_err_t CameraHttpServer::start(uint16_t port)
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.keep_alive_enable = true;
+    config.max_open_sockets = 7; // Ensure enough sockets are open
     config.server_port = port;
     config.ctrl_port = port + 1000; // avoid conflict
 
