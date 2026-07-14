@@ -268,6 +268,10 @@ void WifiManager::eventHandler(void *arg, esp_event_base_t event_base,
         }
         s_connected = false;
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+        // Force the Wi-Fi radio to stay awake for maximum throughput
+        ESP_LOGI(TAG, "Wi-Fi power save mode disabled");
+        //
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         ESP_LOGI(TAG, "Got IP Address: " IPSTR, IP2STR(&event->ip_info.ip));
         s_connected = true;
@@ -287,3 +291,4 @@ std::string WifiManager::getLocalIP() const
     }
     return "0.0.0.0";
 }
+
