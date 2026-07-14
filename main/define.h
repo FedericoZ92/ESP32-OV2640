@@ -20,6 +20,20 @@
 // Stop camera acquisition after the first successfully published frame when set to 1.
 #define STOP_ACQUISITION_AFTER_1_FRAME 0
 
+// Transport selection: set exactly one of these to 1.
+// USE_TCP uses the existing HTTP server transport.
+// USE_UDP uses datagram streaming over UDP.
+#define USE_TCP 1
+#define USE_UDP 0
+
+// UDP stream settings (used only when USE_UDP=1).
+#define UDP_STREAM_PORT 5001
+#define UDP_STREAM_MAX_PAYLOAD 1024
+
+#if ((USE_TCP + USE_UDP) != 1)
+    #error "Invalid transport config: set exactly one of USE_TCP or USE_UDP to 1"
+#endif
+
 // JavaScript-compatible boolean string derived from ENABLE_POLLING_FALLBACK.
 #if ENABLE_POLLING_FALLBACK
     #define ENABLE_POLLING_FALLBACK_JS "true"

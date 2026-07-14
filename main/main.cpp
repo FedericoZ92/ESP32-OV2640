@@ -9,6 +9,9 @@
 #include <esp_flash.h>
 #include <esp_timer.h>
 #include <esp_camera.h>
+#include <lwip/sockets.h>
+#include <lwip/inet.h>
+#include <lwip/netdb.h>
 #include "camera-driver/camera-driver.h"
 #include "http-server/http-server.h"
 #include "wifi/wifi.h"
@@ -452,6 +455,179 @@ esp_err_t streamRgbCallback(httpd_req_t *req)
     return captureRgbCallback(req);
 }
 
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint32_t frameSeq;
+    uint16_t chunkIndex;
+    uint16_t chunkCount;
+    uint16_t payloadLen;
+    uint16_t frameLen;
+    uint32_t frameAgeMs;
+} UdpFrameHeader;
+
+void udp_stream_task(void *arg)
+{
+    const uint32_t kMagic = 0x47504455U; // 'UDPG'
+    const int kMaxPayload = UDP_STREAM_MAX_PAYLOAD;
+    const int kPort = UDP_STREAM_PORT;
+
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (sock < 0) {
+        ESP_LOGE("UDP_STREAM", "Failed to create UDP socket");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    struct sockaddr_in localAddr = {};
+    localAddr.sin_family = AF_INET;
+    localAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    localAddr.sin_port = htons((uint16_t)kPort);
+
+    if (bind(sock, (struct sockaddr *)&localAddr, sizeof(localAddr)) != 0) {
+        ESP_LOGE("UDP_STREAM", "Failed to bind UDP socket on port %d", kPort);
+        close(sock);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    struct timeval recvTimeout = {};
+    recvTimeout.tv_sec = 0;
+    recvTimeout.tv_usec = 200000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &recvTimeout, sizeof(recvTimeout));
+
+    ESP_LOGI("UDP_STREAM", "UDP stream waiting for client hello on port %d", kPort);
+
+    bool hasClient = false;
+    struct sockaddr_in clientAddr = {};
+    socklen_t clientAddrLen = sizeof(clientAddr);
+
+    uint8_t *frameSnapshot = (uint8_t *)heap_caps_malloc(TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE, MALLOC_CAP_8BIT);
+    if (!frameSnapshot) {
+        ESP_LOGE("UDP_STREAM", "Failed to allocate frame snapshot buffer");
+        close(sock);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    uint8_t packet[sizeof(UdpFrameHeader) + UDP_STREAM_MAX_PAYLOAD];
+    uint32_t lastSentSeq = 0;
+    uint32_t txFrames = 0;
+    uint32_t txChunks = 0;
+    uint32_t txErrors = 0;
+    int64_t txWindowStartUs = esp_timer_get_time();
+
+    while (true) {
+        char helloBuf[64];
+        struct sockaddr_in rxAddr = {};
+        socklen_t rxLen = sizeof(rxAddr);
+        int rx = recvfrom(sock, helloBuf, sizeof(helloBuf) - 1, 0, (struct sockaddr *)&rxAddr, &rxLen);
+        if (rx > 0) {
+            helloBuf[rx] = '\0';
+            clientAddr = rxAddr;
+            clientAddrLen = rxLen;
+            hasClient = true;
+            ESP_LOGI("UDP_STREAM", "Client registered: %s:%u (%s)",
+                     inet_ntoa(clientAddr.sin_addr),
+                     ntohs(clientAddr.sin_port),
+                     helloBuf);
+        }
+
+        if (!hasClient) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+
+        size_t frameLen = 0;
+        uint8_t frameIndex = 0;
+        uint32_t frameSeq = 0;
+        int64_t framePublishUs = 0;
+        taskENTER_CRITICAL(&httpFrameMetaLock);
+        frameLen = activeHttpFrameLen;
+        frameIndex = activeHttpFrameIndex;
+        frameSeq = activeHttpFrameSeq;
+        framePublishUs = activeHttpFramePublishUs;
+        taskEXIT_CRITICAL(&httpFrameMetaLock);
+
+        if (frameLen == 0 || !httpFrameBuffers[frameIndex]) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        if (frameLen > (TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE)) {
+            frameLen = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE;
+        }
+
+        if (frameSeq == lastSentSeq) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+
+        memcpy(frameSnapshot, httpFrameBuffers[frameIndex], frameLen);
+
+        const uint16_t chunkCount = (uint16_t)((frameLen + kMaxPayload - 1) / kMaxPayload);
+        const int64_t nowUs = esp_timer_get_time();
+        const uint32_t frameAgeMs = (framePublishUs > 0 && nowUs > framePublishUs)
+            ? (uint32_t)((nowUs - framePublishUs) / 1000)
+            : 0;
+
+        bool frameFailed = false;
+        for (uint16_t chunkIndex = 0; chunkIndex < chunkCount; chunkIndex++) {
+            const size_t offset = chunkIndex * kMaxPayload;
+            const size_t remaining = frameLen - offset;
+            const uint16_t payloadLen = (uint16_t)((remaining > (size_t)kMaxPayload) ? kMaxPayload : remaining);
+
+            UdpFrameHeader header = {};
+            header.magic = htonl(kMagic);
+            header.frameSeq = htonl(frameSeq);
+            header.chunkIndex = htons(chunkIndex);
+            header.chunkCount = htons(chunkCount);
+            header.payloadLen = htons(payloadLen);
+            header.frameLen = htons((uint16_t)frameLen);
+            header.frameAgeMs = htonl(frameAgeMs);
+
+            memcpy(packet, &header, sizeof(header));
+            memcpy(packet + sizeof(header), frameSnapshot + offset, payloadLen);
+
+            int sent = sendto(sock,
+                              packet,
+                              sizeof(header) + payloadLen,
+                              0,
+                              (struct sockaddr *)&clientAddr,
+                              clientAddrLen);
+            if (sent < 0) {
+                txErrors++;
+                frameFailed = true;
+                break;
+            }
+            txChunks++;
+        }
+
+        if (!frameFailed) {
+            lastSentSeq = frameSeq;
+            txFrames++;
+        }
+
+        const int64_t elapsedUs = nowUs - txWindowStartUs;
+        if (elapsedUs >= 2000000) {
+            const float fps = (txFrames * 1000000.0f) / (float)elapsedUs;
+            ESP_LOGI("UDP_STREAM",
+                     "tx_fps=%.2f | frames=%lu | chunks=%lu | err=%lu | last_seq=%lu | frame_len=%u",
+                     fps,
+                     (unsigned long)txFrames,
+                     (unsigned long)txChunks,
+                     (unsigned long)txErrors,
+                     (unsigned long)lastSentSeq,
+                     (unsigned int)frameLen);
+            txWindowStartUs = nowUs;
+            txFrames = 0;
+            txChunks = 0;
+            txErrors = 0;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+}
+
 extern "C" void app_main(void)
 {
     esp_log_level_set("*", ESP_LOG_INFO);
@@ -539,28 +715,43 @@ extern "C" void app_main(void)
         ESP_LOGW(OV2640_TAG, "Failed to get camera sensor handle for flipping");
     }
 
-    // HTTP server task 
-    auto http_server_task = [](void* arg) {
-        server.setCaptureHandler(captureRgbCallback);
-        server.setStreamHandler(streamRgbCallback);
-        if (server.start() == ESP_OK) {
-            ESP_LOGI(OV2640_TAG, "HTTP Server started. Open http://%s/", wifi.getLocalIP().c_str());
-        } else {
-            ESP_LOGE(OV2640_TAG, "HTTP Server not started");
-        }
-        vTaskDelete(NULL); // Clean up task after starting server
-    };
+    #if USE_TCP
+        // HTTP server task
+        auto http_server_task = [](void* arg) {
+            server.setCaptureHandler(captureRgbCallback);
+            server.setStreamHandler(streamRgbCallback);
+            if (server.start() == ESP_OK) {
+                ESP_LOGI(OV2640_TAG, "TCP mode active. HTTP server started at http://%s/", wifi.getLocalIP().c_str());
+            } else {
+                ESP_LOGE(OV2640_TAG, "HTTP server not started");
+            }
+            vTaskDelete(NULL); // Clean up task after starting server
+        };
 
-    // Pass the lambda directly to FreeRTOS
-    xTaskCreatePinnedToCore(
-        http_server_task,     // The compiler automatically converts this to a function pointer
-        "http_server_task",
-        4096,
-        NULL,                 // Pass NULL since your lambda doesn't use the 'arg' parameter
-        5,
-        NULL,
-        0                     // Pin to core 0 
-    );
+        // Pass the lambda directly to FreeRTOS
+        xTaskCreatePinnedToCore(
+            http_server_task,
+            "http_server_task",
+            4096,
+            NULL,
+            5,
+            NULL,
+            0
+        );
+    #endif
+
+    #if USE_UDP
+        ESP_LOGI(OV2640_TAG, "UDP mode active. Stream port: %d", UDP_STREAM_PORT);
+        xTaskCreatePinnedToCore(
+            udp_stream_task,
+            "udp_stream_task",
+            6144,
+            NULL,
+            5,
+            NULL,
+            0
+        );
+    #endif
 
     // --- Start capture task ---
     xTaskCreatePinnedToCore(capture_task, 
