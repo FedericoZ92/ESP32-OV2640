@@ -1,5 +1,10 @@
 #pragma once
 
+//IMAGE FORMAT FOR INFERENCE
+#define IMAGE_FRAME_SIZE_FOR_INFERENCE FRAMESIZE_QQVGA //FRAMESIZE_QVGA; //used with inference
+
+#define STREAM_ORIGINALLY_ACQUIRED_IMAGE 1// basically skips the cropping to 96x96 grayscale
+
 // Size of temporary JPEG-related working buffer (bytes).
 #define JPEG_BUFFER_SIZE (20 * 1024)
 
@@ -40,3 +45,5 @@
 #else
     #define ENABLE_POLLING_FALLBACK_JS "false"
 #endif
+
+

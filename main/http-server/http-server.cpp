@@ -64,10 +64,10 @@ static const char *INDEX_HTML = R"rawliteral(
     const ctx = canvas.getContext('2d');
     const statusEl = document.getElementById('status');
     const freezeToggle = document.getElementById('freezeToggle');
-    const width = 96;
-    const height = 96;
-    const imageData = ctx.createImageData(width, height);
-    const frameSize = width * height;
+    let width = 96;
+    let height = 96;
+    let imageData = ctx.createImageData(width, height);
+    let frameSize = width * height;
     let renderedFrames = 0;
     let errorCount = 0;
     let staleFrames = 0;
@@ -82,6 +82,17 @@ static const char *INDEX_HTML = R"rawliteral(
     let lastFpsTime = performance.now();
     let fpsFrames = 0;
     const pollDelayMs = 30;
+
+    function ensureCanvasSize(newWidth, newHeight) {
+      if (newWidth > 0 && newHeight > 0 && (newWidth !== width || newHeight !== height)) {
+        width = newWidth;
+        height = newHeight;
+        frameSize = width * height;
+        canvas.width = width;
+        canvas.height = height;
+        imageData = ctx.createImageData(width, height);
+      }
+    }
 
     function drawGrayFrame(gray) {
       for (let i = 0; i < frameSize; i++) {
@@ -122,9 +133,14 @@ static const char *INDEX_HTML = R"rawliteral(
         const seqHeader = response.headers.get('X-Frame-Seq');
         const ageHeader = response.headers.get('X-Frame-Age-Ms');
         const lenHeader = response.headers.get('X-Frame-Len');
+        const widthHeader = response.headers.get('X-Frame-Width');
+        const heightHeader = response.headers.get('X-Frame-Height');
         const seq = seqHeader ? Number(seqHeader) : -1;
         lastAgeMs = ageHeader ? Number(ageHeader) : 0;
         lastFrameLen = lenHeader ? Number(lenHeader) : 0;
+        const frameWidth = widthHeader ? Number(widthHeader) : width;
+        const frameHeight = heightHeader ? Number(heightHeader) : height;
+        ensureCanvasSize(frameWidth, frameHeight);
         if (seq >= 0) {
           if (lastSeq >= 0 && seq === lastSeq) {
             staleFrames++;

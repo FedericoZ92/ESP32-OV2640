@@ -51,6 +51,8 @@ CheckpointTimer httpTimer;
 static uint8_t* httpFrameBuffers[2] = {nullptr, nullptr};
 static volatile uint8_t activeHttpFrameIndex = 0;
 static volatile size_t activeHttpFrameLen = 0;
+static volatile uint16_t activeHttpFrameWidth = TF_IMAGE_INPUT_SIZE;
+static volatile uint16_t activeHttpFrameHeight = TF_IMAGE_INPUT_SIZE;
 static volatile uint32_t activeHttpFrameSeq = 0;
 static volatile int64_t activeHttpFramePublishUs = 0;
 static volatile bool pauseCameraAcquisition = false;
@@ -60,6 +62,12 @@ uint8_t *rawImageBuffer = nullptr; // raw pixels
 uint8_t* tflitePreEditingBuffer = nullptr; // default: raw buffer
 static uint8_t tfliteGray96x96InputBuffer[TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE];
 
+#if STREAM_ORIGINALLY_ACQUIRED_IMAGE
+    static constexpr size_t kPublishedFrameMaxBytes = 160 * 120; // QQVGA grayscale
+#else
+    static constexpr size_t kPublishedFrameMaxBytes = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE;
+#endif
+
 // Background task: capture and process frames continuously
 void capture_task(void *arg)
 {
@@ -67,7 +75,7 @@ void capture_task(void *arg)
     uint32_t producedFrames = 0;
     int64_t producerWindowStartUs = esp_timer_get_time();
     static uint8_t processedFrame[TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE];
-    const size_t frameBufferSize = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE;
+    const size_t frameBufferSize = kPublishedFrameMaxBytes;
     httpFrameBuffers[0] = (uint8_t*) heap_caps_malloc(frameBufferSize, MALLOC_CAP_SPIRAM);
     httpFrameBuffers[1] = (uint8_t*) heap_caps_malloc(frameBufferSize, MALLOC_CAP_SPIRAM);
     if (!httpFrameBuffers[0] || !httpFrameBuffers[1]) {
@@ -151,14 +159,44 @@ void capture_task(void *arg)
                 memcpy(tfliteGray96x96InputBuffer, processedFrame, TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE);
             }
 
-            // Publish latest grayscale frame first so HTTP is not blocked by inference latency.
-            const int gray_size = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE; // 96x96
+            // Publish latest frame buffer for network transport.
+            const uint8_t *publishSrc = nullptr;
+            size_t publishLen = 0;
+            uint16_t publishWidth = TF_IMAGE_INPUT_SIZE;
+            uint16_t publishHeight = TF_IMAGE_INPUT_SIZE;
+
+            #if STREAM_ORIGINALLY_ACQUIRED_IMAGE
+                if (frameBuffer->format == PIXFORMAT_GRAYSCALE) {
+                    publishSrc = tflitePreEditingBuffer;
+                    publishLen = (size_t)frameBuffer->width * (size_t)frameBuffer->height;
+                    publishWidth = frameBuffer->width;
+                    publishHeight = frameBuffer->height;
+                } else {
+                    // Fallback to 96x96 stream for non-grayscale capture modes.
+                    publishSrc = tfliteGray96x96InputBuffer;
+                    publishLen = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE;
+                }
+            #else
+                publishSrc = tfliteGray96x96InputBuffer;
+                publishLen = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE;
+            #endif
+
+            if (publishLen > frameBufferSize) {
+                ESP_LOGW(CAPTURE_TAG,
+                         "Publish frame too large (%u > %u), truncating",
+                         (unsigned int)publishLen,
+                         (unsigned int)frameBufferSize);
+                publishLen = frameBufferSize;
+            }
+
             uint8_t publishIndex = activeHttpFrameIndex ^ 1;
-            if (httpFrameBuffers[publishIndex]) {
-                memcpy(httpFrameBuffers[publishIndex], tfliteGray96x96InputBuffer, gray_size);
+            if (httpFrameBuffers[publishIndex] && publishSrc && publishLen > 0) {
+                memcpy(httpFrameBuffers[publishIndex], publishSrc, publishLen);
                 const int64_t nowUs = esp_timer_get_time();
                 taskENTER_CRITICAL(&httpFrameMetaLock);
-                activeHttpFrameLen = gray_size;
+                activeHttpFrameLen = publishLen;
+                activeHttpFrameWidth = publishWidth;
+                activeHttpFrameHeight = publishHeight;
                 activeHttpFrameIndex = publishIndex;
                 activeHttpFrameSeq++;
                 activeHttpFramePublishUs = nowUs;
@@ -254,11 +292,15 @@ esp_err_t captureRgbCallback(httpd_req_t *req)
 
     size_t frameLen = 0;
     uint8_t frameIndex = 0;
+    uint16_t frameWidth = TF_IMAGE_INPUT_SIZE;
+    uint16_t frameHeight = TF_IMAGE_INPUT_SIZE;
     uint32_t frameSeq = 0;
     int64_t framePublishUs = 0;
     taskENTER_CRITICAL(&httpFrameMetaLock);
     frameLen = activeHttpFrameLen;
     frameIndex = activeHttpFrameIndex;
+    frameWidth = activeHttpFrameWidth;
+    frameHeight = activeHttpFrameHeight;
     frameSeq = activeHttpFrameSeq;
     framePublishUs = activeHttpFramePublishUs;
     taskEXIT_CRITICAL(&httpFrameMetaLock);
@@ -277,6 +319,14 @@ esp_err_t captureRgbCallback(httpd_req_t *req)
     char lenBuf[16];
     snprintf(lenBuf, sizeof(lenBuf), "%u", (unsigned int)frameLen);
     httpd_resp_set_hdr(req, "X-Frame-Len", lenBuf);
+
+    char widthBuf[8];
+    snprintf(widthBuf, sizeof(widthBuf), "%u", (unsigned int)frameWidth);
+    httpd_resp_set_hdr(req, "X-Frame-Width", widthBuf);
+
+    char heightBuf[8];
+    snprintf(heightBuf, sizeof(heightBuf), "%u", (unsigned int)frameHeight);
+    httpd_resp_set_hdr(req, "X-Frame-Height", heightBuf);
 
     if (httpReqWindowStartUs == 0) {
         httpReqWindowStartUs = nowUs;
@@ -308,7 +358,7 @@ esp_err_t captureRgbCallback(httpd_req_t *req)
         sendPtr = httpFrameBuffers[frameIndex];
     } else {
         // Send a blank frame until the first capture is published.
-        static uint8_t blank[TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE] = {0};
+        static uint8_t blank[kPublishedFrameMaxBytes] = {0};
         sendPtr = blank;
         sendLen = sizeof(blank);
     }
@@ -501,7 +551,7 @@ void udp_stream_task(void *arg)
     struct sockaddr_in clientAddr = {};
     socklen_t clientAddrLen = sizeof(clientAddr);
 
-    uint8_t *frameSnapshot = (uint8_t *)heap_caps_malloc(TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE, MALLOC_CAP_8BIT);
+    uint8_t *frameSnapshot = (uint8_t *)heap_caps_malloc(kPublishedFrameMaxBytes, MALLOC_CAP_8BIT);
     if (!frameSnapshot) {
         ESP_LOGE("UDP_STREAM", "Failed to allocate frame snapshot buffer");
         close(sock);
@@ -553,8 +603,8 @@ void udp_stream_task(void *arg)
             continue;
         }
 
-        if (frameLen > (TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE)) {
-            frameLen = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE;
+        if (frameLen > kPublishedFrameMaxBytes) {
+            frameLen = kPublishedFrameMaxBytes;
         }
 
         if (frameSeq == lastSentSeq) {

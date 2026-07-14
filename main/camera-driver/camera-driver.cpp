@@ -1,6 +1,7 @@
 
 #include "camera-driver.h"
 #include "esp_log.h"
+#include "define.h"
 
 static const char *TAG = "CameraDriver";
 
@@ -51,9 +52,10 @@ void CameraDriver::configureCamera() {
     config.pin_reset = RESET_GPIO_NUM;
     config.xclk_freq_hz = 10000000; //was 20000000
     config.pixel_format = PIXFORMAT_GRAYSCALE; //PIXFORMAT_JPEG; //PIXFORMAT_GRAYSCALE; 
-    config.frame_size = FRAMESIZE_QQVGA; //FRAMESIZE_QVGA;
+    //IMAGE_FRAME_SIZE_FOR_INFERENCE; // FRAMESIZE_QQVGA; //used with inference
+    config.frame_size = FRAMESIZE_QQVGA;
     config.jpeg_quality = 12;
-    config.fb_count = 1;
+    config.fb_count = 3;
     config.fb_location = CAMERA_FB_IN_PSRAM; //Store in internal RAM
     config.grab_mode = CAMERA_GRAB_LATEST;
 }
