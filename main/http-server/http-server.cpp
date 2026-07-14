@@ -158,120 +158,67 @@ static const char *INDEX_HTML = R"rawliteral(
       }
     }
 
-    // Helper function to search bytes in stream buffer
-    function findSubarray(arr, sub) {
-      const limit = arr.length - sub.length + 1;
-      for (let i = 0; i < limit; i++) {
-        let match = true;
-        for (let j = 0; j < sub.length; j++) {
-          if (arr[i+j] !== sub[j]) { match = false; break; }
-        }
-        if (match) return i;
-      }
-      return -1;
-    }
-
-    async function runStream() {
+    async function pollFrames() {
       try {
-        const response = await fetch('/stream.rgb');
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        
-        statusEl.textContent = "Streaming active...";
-        const reader = response.body.getReader();
-        const boundary = "--123456789000000000000987654321";
-        const boundaryBytes = new TextEncoder().encode(boundary);
-        
-        let buffer = new Uint8Array(0);
-        
-        while (true) {
-          if (freezeToggle.checked) {
-            // If frozen for debugging, read but discard to avoid memory build-up
-            const { value, done } = await reader.read();
-            if (done) break;
-            continue;
-          }
+        const freezeValue = freezeToggle.checked ? '1' : '0';
+        const response = await fetch(`/capture.rgb?ts=${Date.now()}&freeze=${freezeValue}`, { cache: 'no-store' });
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
 
-          const { value, done } = await reader.read();
-          if (done) break;
-          
-          // Append new packet data
-          const temp = new Uint8Array(buffer.length + value.length);
-          temp.set(buffer);
-          temp.set(value, buffer.length);
-          buffer = temp;
-          
-          while (true) {
-            const firstBoundaryIdx = findSubarray(buffer, boundaryBytes);
-            if (firstBoundaryIdx === -1) break;
-            
-            const secondBoundaryIdx = findSubarray(buffer.subarray(firstBoundaryIdx + boundaryBytes.length), boundaryBytes);
-            if (secondBoundaryIdx === -1) break; // Need more data chunks
-            
-            const partStart = firstBoundaryIdx + boundaryBytes.length;
-            const partEnd = partStart + secondBoundaryIdx;
-            const part = buffer.subarray(partStart, partEnd);
-            
-            // Slice buffer & immediately instantiate new Uint8Array to force garbage collection of old segment
-            buffer = new Uint8Array(buffer.subarray(partStart + secondBoundaryIdx));
-            
-            // Separate Headers and Body using double CRLF
-            const doubleCRLFBytes = new Uint8Array([13, 10, 13, 10]);
-            const headerEndIdx = findSubarray(part, doubleCRLFBytes);
-            if (headerEndIdx === -1) continue;
-            
-            const headerStr = new TextDecoder().decode(part.subarray(0, headerEndIdx));
-            const bodyBytes = part.subarray(headerEndIdx + 4);
-            
-            // Read HTTP headers of the part
-            const headers = {};
-            headerStr.split('\r\n').forEach(line => {
-              const pts = line.split(':');
-              if (pts.length >= 2) {
-                headers[pts[0].trim().toLowerCase()] = pts.slice(1).join(':').trim();
-              }
-            });
-            
-            const seq = headers['x-frame-seq'] ? Number(headers['x-frame-seq']) : -1;
-            lastAgeMs = headers['x-frame-age-ms'] ? Number(headers['x-frame-age-ms']) : 0;
-            lastFrameLen = headers['x-frame-len'] ? Number(headers['x-frame-len']) : 0;
-            lastFrameFormat = headers['x-frame-format'] || 'gray8';
-            const fWidth = headers['x-frame-width'] ? Number(headers['x-frame-width']) : width;
-            const fHeight = headers['x-frame-height'] ? Number(headers['x-frame-height']) : height;
-            
-            ensureCanvasSize(fWidth, fHeight);
-            
-            if (seq >= 0) {
-              if (lastSeq >= 0 && seq === lastSeq) { staleFrames++; }
-              lastSeq = seq;
-            }
-            
-            const decodeStart = performance.now();
-            if (lastFrameFormat === 'jpeg') {
-              // Draw JPEG binary buffer
-              await drawJpegFrame(bodyBytes.buffer.slice(bodyBytes.byteOffset, bodyBytes.byteOffset + lastFrameLen));
-            } else {
-              // Draw raw grayscale buffer
-              lastDecodeMs = performance.now() - decodeStart;
-              if (bodyBytes.length >= frameSize) {
-                const drawStart = performance.now();
-                drawGrayFrame(bodyBytes.subarray(0, lastFrameLen));
-                lastDrawMs = performance.now() - drawStart;
-                errorCount = 0;
-              } else {
-                discardedFrames++;
-              }
-            }
+        reqCount++;
+        const seqHeader = response.headers.get('X-Frame-Seq');
+        const ageHeader = response.headers.get('X-Frame-Age-Ms');
+        const lenHeader = response.headers.get('X-Frame-Len');
+        const formatHeader = response.headers.get('X-Frame-Format');
+        const contentType = response.headers.get('Content-Type') || '';
+        const widthHeader = response.headers.get('X-Frame-Width');
+        const heightHeader = response.headers.get('X-Frame-Height');
+
+        const seq = seqHeader ? Number(seqHeader) : -1;
+        lastAgeMs = ageHeader ? Number(ageHeader) : 0;
+        lastFrameLen = lenHeader ? Number(lenHeader) : 0;
+        lastFrameFormat = formatHeader || (contentType.includes('image/jpeg') ? 'jpeg' : 'gray8');
+        const fWidth = widthHeader ? Number(widthHeader) : width;
+        const fHeight = heightHeader ? Number(heightHeader) : height;
+        ensureCanvasSize(fWidth, fHeight);
+
+        if (seq >= 0) {
+          if (lastSeq >= 0 && seq === lastSeq) {
+            staleFrames++;
+          }
+          lastSeq = seq;
+        }
+
+        const decodeStart = performance.now();
+        const buffer = await response.arrayBuffer();
+        const bytes = new Uint8Array(buffer);
+        const looksLikeJpeg = bytes.length >= 2 && bytes[0] === 0xFF && bytes[1] === 0xD8;
+
+        if (lastFrameFormat === 'jpeg' || looksLikeJpeg) {
+          lastFrameFormat = 'jpeg';
+          await drawJpegFrame(buffer);
+        } else {
+          lastDecodeMs = performance.now() - decodeStart;
+          if (bytes.length >= frameSize) {
+            const drawStart = performance.now();
+            drawGrayFrame(bytes.subarray(0, frameSize));
+            lastDrawMs = performance.now() - drawStart;
+          } else {
+            discardedFrames++;
           }
         }
+
+        errorCount = 0;
       } catch (err) {
         errorCount++;
-        statusEl.textContent = `Stream lost, retrying... (${errorCount}) ${err.message || ''}`;
-        console.error(err);
-        setTimeout(runStream, 1000); // Wait 1 sec and reconnect
+        statusEl.textContent = `Waiting for frames... (${errorCount}) ${err && err.message ? err.message : ''}`;
+      } finally {
+        setTimeout(pollFrames, 30);
       }
     }
 
-    runStream();
+    pollFrames();
   </script>
 </body>
 </html>
