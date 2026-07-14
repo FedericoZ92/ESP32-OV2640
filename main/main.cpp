@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <cstring>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
@@ -49,6 +50,7 @@ static volatile uint8_t activeHttpFrameIndex = 0;
 static volatile size_t activeHttpFrameLen = 0;
 static volatile uint32_t activeHttpFrameSeq = 0;
 static volatile int64_t activeHttpFramePublishUs = 0;
+static volatile bool pauseCameraAcquisition = false;
 static portMUX_TYPE httpFrameMetaLock = portMUX_INITIALIZER_UNLOCKED;
 static TfLiteWrapper tf_wrapper;
 uint8_t *rawImageBuffer = nullptr; // raw pixels
@@ -72,6 +74,12 @@ void capture_task(void *arg)
     activeHttpFrameLen = 0;
 
     while (true) {
+        if (pauseCameraAcquisition) {
+            // Freeze mode keeps serving the last published frame to isolate HTTP/network speed.
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
         // --- Handle JPEG decoding or raw frame ---
         ESP_LOGD(CAPTURE_TAG, "Handle JPEG decoding or raw frame, mark checkpoint"); 
         cameraAcquisitionTimer.checkpoint();
@@ -167,6 +175,13 @@ void capture_task(void *arg)
                     producedFrames = 0;
                     producerWindowStartUs = nowUs;
                 }
+
+                #if STOP_ACQUISITION_AFTER_1_FRAME
+                    if (activeHttpFrameSeq == 1) {
+                        pauseCameraAcquisition = true;
+                        ESP_LOGW(CAPTURE_TAG, "STOP_ACQUISITION_AFTER_1_FRAME active: acquisition paused after first frame");
+                    }
+                #endif
             }
 
             // Run inference
@@ -204,6 +219,34 @@ void capture_task(void *arg)
 esp_err_t captureRgbCallback(httpd_req_t *req)
 {
     const int64_t reqStartUs = esp_timer_get_time();
+    static int64_t httpReqWindowStartUs = 0;
+    static uint32_t httpReqWindowCount = 0;
+    static uint32_t httpReqWindowStale = 0;
+    static uint32_t httpReqWindowAdvanceEvents = 0;
+    static uint32_t httpReqWindowAdvancedFrames = 0;
+    static uint32_t httpReqWindowMaxAdvance = 0;
+    static uint32_t httpReqWindowDroppedEstimate = 0;
+    static uint32_t httpReqWindowMaxDroppedBurst = 0;
+    static uint32_t httpReqWindowLastSeq = 0;
+
+    // Optional debug toggle: /capture.rgb?freeze=1 or /capture.rgb?freeze=0
+    char query[64] = {0};
+    const size_t queryLen = httpd_req_get_url_query_len(req);
+    if (queryLen > 0 && queryLen < sizeof(query)) {
+        if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+            char freezeVal[8] = {0};
+            if (httpd_query_key_value(query, "freeze", freezeVal, sizeof(freezeVal)) == ESP_OK) {
+                const bool newPauseState = (strcmp(freezeVal, "1") == 0 || strcmp(freezeVal, "true") == 0);
+                static bool lastLoggedPauseState = false;
+                pauseCameraAcquisition = newPauseState;
+                if (newPauseState != lastLoggedPauseState) {
+                    ESP_LOGW(CAPTURE_TAG, "Capture freeze mode: %s", newPauseState ? "ON" : "OFF");
+                    lastLoggedPauseState = newPauseState;
+                }
+            }
+        }
+    }
+
     httpd_resp_set_type(req, "application/octet-stream");
 
     size_t frameLen = 0;
@@ -232,34 +275,29 @@ esp_err_t captureRgbCallback(httpd_req_t *req)
     snprintf(lenBuf, sizeof(lenBuf), "%u", (unsigned int)frameLen);
     httpd_resp_set_hdr(req, "X-Frame-Len", lenBuf);
 
-    static uint32_t servedWindowCount = 0;
-    static uint32_t staleWindowCount = 0;
-    static uint32_t lastServedSeq = 0;
-    static int64_t servedWindowStartUs = 0;
-    if (servedWindowStartUs == 0) {
-        servedWindowStartUs = nowUs;
+    if (httpReqWindowStartUs == 0) {
+        httpReqWindowStartUs = nowUs;
     }
 
-    servedWindowCount++;
-    if (frameSeq == lastServedSeq && frameSeq != 0) {
-        staleWindowCount++;
+    httpReqWindowCount++;
+    if (frameSeq == httpReqWindowLastSeq && frameSeq != 0) {
+        httpReqWindowStale++;
+    } else if (httpReqWindowLastSeq != 0 && frameSeq > httpReqWindowLastSeq) {
+        const uint32_t advancedBy = frameSeq - httpReqWindowLastSeq;
+        httpReqWindowAdvanceEvents++;
+        httpReqWindowAdvancedFrames += advancedBy;
+        if (advancedBy > 1) {
+            const uint32_t dropped = advancedBy - 1;
+            httpReqWindowDroppedEstimate += dropped;
+            if (dropped > httpReqWindowMaxDroppedBurst) {
+                httpReqWindowMaxDroppedBurst = dropped;
+            }
+        }
+        if (advancedBy > httpReqWindowMaxAdvance) {
+            httpReqWindowMaxAdvance = advancedBy;
+        }
     }
-    lastServedSeq = frameSeq;
-
-    const int64_t servedElapsedUs = nowUs - servedWindowStartUs;
-    if (servedElapsedUs >= 2000000) {
-        const float servedFps = (servedWindowCount * 1000000.0f) / (float)servedElapsedUs;
-        ESP_LOGI("HTTP_CAPTURE", "Served FPS: %.2f | stale responses: %lu/%lu | seq=%lu | age_ms=%lld | len=%u",
-                 servedFps,
-                 (unsigned long)staleWindowCount,
-                 (unsigned long)servedWindowCount,
-                 (unsigned long)frameSeq,
-                 (long long)(ageUs / 1000),
-                 (unsigned int)frameLen);
-        servedWindowCount = 0;
-        staleWindowCount = 0;
-        servedWindowStartUs = nowUs;
-    }
+    httpReqWindowLastSeq = frameSeq;
 
     const uint8_t *sendPtr = nullptr;
     size_t sendLen = frameLen;
@@ -296,6 +334,12 @@ esp_err_t captureRgbCallback(httpd_req_t *req)
     }
     if (sendErr != ESP_OK) {
         txWindowErrCount++;
+        static int64_t lastSendErrLogUs = 0;
+        const int64_t nowErrUs = sendEndUs;
+        if (nowErrUs - lastSendErrLogUs >= 1000000) {
+            ESP_LOGW("HTTP_TX", "httpd_resp_send failed: %s", esp_err_to_name(sendErr));
+            lastSendErrLogUs = nowErrUs;
+        }
     }
 
     const int64_t txElapsedUs = sendEndUs - txWindowStartUs;
@@ -319,59 +363,93 @@ esp_err_t captureRgbCallback(httpd_req_t *req)
         txWindowStartUs = sendEndUs;
     }
 
+    const int64_t httpReqElapsedUs = sendEndUs - httpReqWindowStartUs;
+    if (httpReqElapsedUs >= 2000000) {
+        const float reqFps = (httpReqWindowCount * 1000000.0f) / (float)httpReqElapsedUs;
+        const float avgAdvance = (httpReqWindowAdvanceEvents > 0)
+            ? ((float)httpReqWindowAdvancedFrames / (float)httpReqWindowAdvanceEvents)
+            : 0.0f;
+        const float droppedPerSec = (httpReqWindowDroppedEstimate * 1000000.0f) / (float)httpReqElapsedUs;
+        const float droppedPerReq = (httpReqWindowCount > 0)
+            ? ((float)httpReqWindowDroppedEstimate / (float)httpReqWindowCount)
+            : 0.0f;
+        ESP_LOGI("HTTP_CAPTURE",
+                 "req_fps=%.2f | stale=%lu/%lu | dropped_est=%lu | drop_per_req=%.2f | drop_per_sec=%.2f | seq=%lu | age_ms=%lld | len=%u | producer_advance_avg=%.2f | producer_advance_max=%lu",
+                 reqFps,
+                 (unsigned long)httpReqWindowStale,
+                 (unsigned long)httpReqWindowCount,
+                 (unsigned long)httpReqWindowDroppedEstimate,
+                 droppedPerReq,
+                 droppedPerSec,
+                 (unsigned long)frameSeq,
+                 (long long)(ageUs / 1000),
+                 (unsigned int)sendLen,
+                 avgAdvance,
+                 (unsigned long)httpReqWindowMaxAdvance);
+
+        if (httpReqWindowDroppedEstimate > 0) {
+            const float dropRatioPerReq = (httpReqWindowCount > 0)
+                ? ((float)httpReqWindowDroppedEstimate / (float)httpReqWindowCount)
+                : 0.0f;
+            const float dropSeverity = ((httpReqWindowDroppedEstimate + httpReqWindowCount) > 0)
+                ? ((float)httpReqWindowDroppedEstimate /
+                   (float)(httpReqWindowDroppedEstimate + httpReqWindowCount))
+                : 0.0f;
+            const bool enoughSamples = (httpReqWindowCount >= 10);
+            const bool activeClient = (reqFps >= 3.0f);
+
+            if (!enoughSamples || !activeClient) {
+                ESP_LOGW("HTTP_CAPTURE",
+                         "FRAME_DROP_STATE: low-sample/backlog window (dropped=%lu, req=%lu, req_fps=%.2f, drop_per_req=%.2f, max_burst=%lu)",
+                         (unsigned long)httpReqWindowDroppedEstimate,
+                         (unsigned long)httpReqWindowCount,
+                         reqFps,
+                         dropRatioPerReq,
+                         (unsigned long)httpReqWindowMaxDroppedBurst);
+            } else if (dropSeverity >= 0.50f || httpReqWindowMaxDroppedBurst >= 5) {
+                ESP_LOGE("HTTP_CAPTURE",
+                         "FRAME_DROP_STATE: heavy drop detected (dropped=%lu, req=%lu, severity=%.2f, drop_per_req=%.2f, max_burst=%lu)",
+                         (unsigned long)httpReqWindowDroppedEstimate,
+                         (unsigned long)httpReqWindowCount,
+                         dropSeverity,
+                         dropRatioPerReq,
+                         (unsigned long)httpReqWindowMaxDroppedBurst);
+            } else {
+                ESP_LOGW("HTTP_CAPTURE",
+                         "FRAME_DROP_STATE: drop detected (dropped=%lu, req=%lu, severity=%.2f, drop_per_req=%.2f, max_burst=%lu)",
+                         (unsigned long)httpReqWindowDroppedEstimate,
+                         (unsigned long)httpReqWindowCount,
+                         dropSeverity,
+                         dropRatioPerReq,
+                         (unsigned long)httpReqWindowMaxDroppedBurst);
+            }
+        }
+
+        if (httpReqWindowCount > 0 && httpReqWindowStale > (httpReqWindowCount / 2)) {
+            ESP_LOGW("HTTP_CAPTURE",
+                     "STALE_FRAME_STATE: over 50%% stale responses (%lu/%lu)",
+                     (unsigned long)httpReqWindowStale,
+                     (unsigned long)httpReqWindowCount);
+        }
+        httpReqWindowStartUs = sendEndUs;
+        httpReqWindowCount = 0;
+        httpReqWindowStale = 0;
+        httpReqWindowAdvanceEvents = 0;
+        httpReqWindowAdvancedFrames = 0;
+        httpReqWindowMaxAdvance = 0;
+        httpReqWindowDroppedEstimate = 0;
+        httpReqWindowMaxDroppedBurst = 0;
+    }
+
     return sendErr;
 }
 
 // HTTP handler — keeps one connection open and streams grayscale frames.
 esp_err_t streamRgbCallback(httpd_req_t *req)
 {
-    static constexpr size_t frameSize = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE;
-    static uint8_t blank[frameSize] = {0};
-    #if !STREAM_KEEP_OPEN
-        static constexpr int maxFramesPerRequest = 8;
-    #endif
-
-    httpd_resp_set_type(req, "application/octet-stream");
- 
-    #if STREAM_KEEP_OPEN
-        httpd_resp_set_hdr(req, "Connection", "keep-alive");
-        while (true) {
-    #else
-        httpd_resp_set_hdr(req, "Connection", "close");
-        for (int frameCount = 0; frameCount < maxFramesPerRequest; ++frameCount) {
-    #endif
-            size_t frameLen = 0;
-            uint8_t frameIndex = 0;
-
-            taskENTER_CRITICAL(&httpFrameMetaLock);
-            frameLen = activeHttpFrameLen;
-            frameIndex = activeHttpFrameIndex;
-            taskEXIT_CRITICAL(&httpFrameMetaLock);
-
-            const uint8_t *framePtr = nullptr;
-            size_t sendLen = frameSize;
-            if (frameLen >= frameSize && httpFrameBuffers[frameIndex]) {
-                framePtr = httpFrameBuffers[frameIndex];
-            } else {
-                framePtr = blank;
-            }
-
-            esp_err_t err = httpd_resp_send_chunk(req, (const char*)framePtr, sendLen);
-            if (err != ESP_OK) {
-                return err;
-            }
-
-            // Keep stream near the page's target refresh rate.
-            vTaskDelay(pdMS_TO_TICKS(250));
-        }
-
-    #if STREAM_KEEP_OPEN
-        // Keep-open mode exits only if send_chunk fails and returns above.
-        return ESP_OK;
-    #else
-        // End this chunked response so the browser reconnect loop can continue.
-        return httpd_resp_send_chunk(req, nullptr, 0);
-    #endif
+    // Keep /stream.rgb compatible but non-blocking: return one frame per request.
+    // This prevents long-lived stream requests from starving other HTTP handlers.
+    return captureRgbCallback(req);
 }
 
 extern "C" void app_main(void)
@@ -432,8 +510,17 @@ extern "C" void app_main(void)
     log_RAM_status("pre Wi-Fi initialization"); // TODO restore
 
     // --- Wi-Fi initialization ---
-    wifi.init();
-    wifi.initSTA(WIFI_NETWORK, WIFI_PASSWORD); // connect to your network
+    esp_err_t wifiInitErr = wifi.init();
+    if (wifiInitErr != ESP_OK) {
+        ESP_LOGE(OV2640_TAG, "Wi-Fi base init failed: %s", esp_err_to_name(wifiInitErr));
+        return;
+    }
+
+    esp_err_t wifiStaErr = wifi.initSTA(WIFI_NETWORK, WIFI_PASSWORD); // connect to your network
+    if (wifiStaErr != ESP_OK) {
+        ESP_LOGE(OV2640_TAG, "Wi-Fi STA connection failed, capture/HTTP startup aborted");
+        return;
+    }
 
     // --- Camera initialization ---
     CameraDriver camera;

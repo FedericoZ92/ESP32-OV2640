@@ -17,6 +17,9 @@
 // Enable browser fallback from /stream.rgb to /capture.rgb polling when set to 1.
 #define ENABLE_POLLING_FALLBACK 0
 
+// Stop camera acquisition after the first successfully published frame when set to 1.
+#define STOP_ACQUISITION_AFTER_1_FRAME 0
+
 // JavaScript-compatible boolean string derived from ENABLE_POLLING_FALLBACK.
 #if ENABLE_POLLING_FALLBACK
     #define ENABLE_POLLING_FALLBACK_JS "true"

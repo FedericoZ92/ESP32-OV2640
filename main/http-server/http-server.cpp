@@ -20,11 +20,13 @@ static const char *INDEX_HTML = R"rawliteral(
 <body>
   <h2>ESP32 Camera Live View (Grayscale)</h2>
   <p id="status">Connecting...</p>
+  <label><input id="freezeToggle" type="checkbox"> Freeze capture (debug)</label>
   <canvas id="camCanvas" width="96" height="96"></canvas>
   <script>
     const canvas = document.getElementById('camCanvas');
     const ctx = canvas.getContext('2d');
     const statusEl = document.getElementById('status');
+    const freezeToggle = document.getElementById('freezeToggle');
     const width = 96;
     const height = 96;
     const imageData = ctx.createImageData(width, height);
@@ -39,8 +41,10 @@ static const char *INDEX_HTML = R"rawliteral(
     let lastDecodeMs = 0;
     let lastDrawMs = 0;
     let lastFrameLen = 0;
+    let reqCount = 0;
     let lastFpsTime = performance.now();
     let fpsFrames = 0;
+    const pollDelayMs = 30;
 
     function drawGrayFrame(gray) {
       for (let i = 0; i < frameSize; i++) {
@@ -58,8 +62,10 @@ static const char *INDEX_HTML = R"rawliteral(
       const elapsed = now - lastFpsTime;
       if (elapsed >= 1000) {
         const fps = (fpsFrames * 1000 / elapsed).toFixed(1);
-        statusEl.textContent = `Frames: ${renderedFrames} | FPS: ${fps} | stale: ${staleFrames} | discard: ${discardedFrames} | age: ${lastAgeMs}ms | net: ${lastFetchMs.toFixed(1)}ms | decode: ${lastDecodeMs.toFixed(1)}ms | draw: ${lastDrawMs.toFixed(1)}ms | len: ${lastFrameLen}`;
+        const reqFps = (reqCount * 1000 / elapsed).toFixed(1);
+        statusEl.textContent = `Frames: ${renderedFrames} | drawFPS: ${fps} | reqFPS: ${reqFps} | stale: ${staleFrames} | discard: ${discardedFrames} | age: ${lastAgeMs}ms | net: ${lastFetchMs.toFixed(1)}ms | decode: ${lastDecodeMs.toFixed(1)}ms | draw: ${lastDrawMs.toFixed(1)}ms | len: ${lastFrameLen} | poll: ${pollDelayMs}ms`;
         fpsFrames = 0;
+        reqCount = 0;
         lastFpsTime = now;
       }
     }
@@ -67,8 +73,10 @@ static const char *INDEX_HTML = R"rawliteral(
     async function pollFrames() {
       try {
         const reqStart = performance.now();
-        const response = await fetch(`/capture.rgb?ts=${Date.now()}`, { cache: 'no-store' });
+        const freezeValue = freezeToggle.checked ? '1' : '0';
+        const response = await fetch(`/capture.rgb?ts=${Date.now()}&freeze=${freezeValue}`, { cache: 'no-store' });
         const respReady = performance.now();
+        reqCount++;
         lastFetchMs = respReady - reqStart;
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}`);
@@ -105,7 +113,7 @@ static const char *INDEX_HTML = R"rawliteral(
         console.error(err);
         statusEl.textContent = `Waiting for frames... (${errorCount})`;
       } finally {
-        setTimeout(pollFrames, 120);
+        setTimeout(pollFrames, pollDelayMs);
       }
     }
 
