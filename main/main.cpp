@@ -516,12 +516,123 @@ esp_err_t captureRgbCallback(httpd_req_t *req)
     return sendErr;
 }
 
-// HTTP handler — keeps one connection open and streams grayscale frames.
+// HTTP handler — keeps one connection open and streams frames continuously.
 esp_err_t streamRgbCallback(httpd_req_t *req)
 {
-    // Keep /stream.rgb compatible but non-blocking: return one frame per request.
-    // This prevents long-lived stream requests from starving other HTTP handlers.
-    return captureRgbCallback(req);
+    esp_err_t res = ESP_OK;
+    char *part_buf = (char*)malloc(256);
+    if (!part_buf) {
+        ESP_LOGE("HTTP_STREAM", "Failed to allocate header buffer for streaming");
+        return ESP_ERR_NO_MEM;
+    }
+
+    #define STREAM_BOUNDARY "123456789000000000000987654321"
+    
+    // 1. Prepare initial Multipart headers
+    res = httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=" STREAM_BOUNDARY);
+    if (res != ESP_OK) { free(part_buf); return res; }
+
+    res = httpd_resp_set_hdr(req, "Connection", "keep-alive");
+    if (res != ESP_OK) { free(part_buf); return res; }
+
+    res = httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    if (res != ESP_OK) { free(part_buf); return res; }
+
+    res = httpd_resp_set_hdr(req, "Pragma", "no-cache");
+    if (res != ESP_OK) { free(part_buf); return res; }
+
+    res = httpd_resp_set_hdr(req, "Expires", "0");
+    if (res != ESP_OK) { free(part_buf); return res; }
+
+    // 2. FORCE-FLUSH HEADERS IMMEDIATELY
+    // Sending a tiny, harmless 2-byte chunk (\r\n) triggers the HTTP server 
+    // to instantly send the HTTP "200 OK" and headers to the browser.
+    // This transitions the browser UI from "Connecting..." to "Streaming active...".
+    res = httpd_resp_send_chunk(req, "\r\n", 2);
+    if (res != ESP_OK) { free(part_buf); return res; }
+
+    uint32_t lastSeenSeq = 0;
+    ESP_LOGI("HTTP_STREAM", "Started real-time multipart stream session");
+
+    // 3. Stream loop
+    while (true) {
+        size_t frameLen = 0;
+        uint8_t frameIndex = 0;
+        uint16_t frameWidth = TF_IMAGE_INPUT_SIZE;
+        uint16_t frameHeight = TF_IMAGE_INPUT_SIZE;
+        pixformat_t frameFormat = PIXFORMAT_GRAYSCALE;
+        uint32_t frameSeq = 0;
+        int64_t framePublishUs = 0;
+
+        // Check if a new frame is ready
+        taskENTER_CRITICAL(&httpFrameMetaLock);
+        frameSeq = activeHttpFrameSeq;
+        taskEXIT_CRITICAL(&httpFrameMetaLock);
+
+        if (frameSeq == lastSeenSeq) {
+            // No new frame yet; yield to give the capture task CPU time
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+
+        // Extract metadata safely
+        taskENTER_CRITICAL(&httpFrameMetaLock);
+        frameLen = activeHttpFrameLen;
+        frameIndex = activeHttpFrameIndex;
+        frameWidth = activeHttpFrameWidth;
+        frameHeight = activeHttpFrameHeight;
+        frameFormat = activeHttpFrameFormat;
+        framePublishUs = activeHttpFramePublishUs;
+        taskEXIT_CRITICAL(&httpFrameMetaLock);
+
+        // Read directly from the active buffer (safe due to double-buffering architecture)
+        const uint8_t *sendPtr = httpFrameBuffers[frameIndex];
+        if (!sendPtr || frameLen == 0) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+
+        const int64_t nowUs = esp_timer_get_time();
+        const int64_t ageUs = (framePublishUs > 0 && nowUs > framePublishUs) ? (nowUs - framePublishUs) : 0;
+
+        // Format multipart headers for this individual frame, including telemetry
+        int hlen = snprintf(part_buf, 256,
+            "--" STREAM_BOUNDARY "\r\n"
+            "Content-Type: %s\r\n"
+            "Content-Length: %d\r\n"
+            "X-Frame-Seq: %lu\r\n"
+            "X-Frame-Age-Ms: %lld\r\n"
+            "X-Frame-Width: %d\r\n"
+            "X-Frame-Height: %d\r\n"
+            "X-Frame-Format: %s\r\n"
+            "\r\n",
+            (frameFormat == PIXFORMAT_JPEG) ? "image/jpeg" : "application/octet-stream",
+            (int)frameLen,
+            (unsigned long)frameSeq,
+            (long long)(ageUs / 1000),
+            (int)frameWidth,
+            (int)frameHeight,
+            (frameFormat == PIXFORMAT_JPEG) ? "jpeg" : "gray8"
+        );
+
+        // Send boundary and custom headers
+        res = httpd_resp_send_chunk(req, part_buf, hlen);
+        if (res != ESP_OK) break;
+
+        // Send binary frame buffer payload
+        res = httpd_resp_send_chunk(req, (const char*)sendPtr, frameLen);
+        if (res != ESP_OK) break;
+
+        // Terminate part with a carriage return line feed
+        res = httpd_resp_send_chunk(req, "\r\n", 2);
+        if (res != ESP_OK) break;
+
+        lastSeenSeq = frameSeq;
+    }
+
+    ESP_LOGI("HTTP_STREAM", "Multipart stream session ended: %s", esp_err_to_name(res));
+    free(part_buf);
+    return res;
 }
 
 typedef struct __attribute__((packed)) {
