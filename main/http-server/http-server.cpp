@@ -53,21 +53,43 @@ static const char *INDEX_HTML = R"rawliteral(
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>ESP32 Camera Live View</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      margin: 20px;
+    }
+    #status {
+      font-family: monospace;
+      background: #f0f0f0;
+      padding: 8px;
+      border-radius: 4px;
+      word-break: break-all;
+    }
+    canvas {
+      display: block;
+      margin-top: 10px;
+      background: #000;
+    }
+  </style>
 </head>
 <body>
   <h2>ESP32 Camera Live View (Grayscale)</h2>
   <p id="status">Connecting...</p>
   <label><input id="freezeToggle" type="checkbox"> Freeze capture (debug)</label>
   <canvas id="camCanvas" width="96" height="96"></canvas>
+
   <script>
     const canvas = document.getElementById('camCanvas');
     const ctx = canvas.getContext('2d');
     const statusEl = document.getElementById('status');
     const freezeToggle = document.getElementById('freezeToggle');
-    let width = 96;
-    let height = 96;
-    let imageData = ctx.createImageData(width, height);
-    let frameSize = width * height;
+
+    let width = 0;
+    let height = 0;
+    let frameSize = 0;
+    let imageData = null;
+    let buf32 = null; // 32-bit view of canvas pixel buffer for fast writes
+
     let renderedFrames = 0;
     let errorCount = 0;
     let staleFrames = 0;
@@ -82,7 +104,8 @@ static const char *INDEX_HTML = R"rawliteral(
     let reqCount = 0;
     let lastFpsTime = performance.now();
     let fpsFrames = 0;
-    const pollDelayMs = 30;
+    
+    let isFetching = false; // Prevents overlapping HTTP requests
 
     function ensureCanvasSize(newWidth, newHeight) {
       if (newWidth > 0 && newHeight > 0 && (newWidth !== width || newHeight !== height)) {
@@ -92,31 +115,29 @@ static const char *INDEX_HTML = R"rawliteral(
         canvas.width = width;
         canvas.height = height;
         imageData = ctx.createImageData(width, height);
+        // Create a 32-bit typed array sharing the exact same underlying memory buffer
+        buf32 = new Uint32Array(imageData.data.buffer);
       }
     }
 
+    // Initialize default canvas size
+    ensureCanvasSize(96, 96);
+
     function drawGrayFrame(gray) {
-      for (let i = 0; i < frameSize; i++) {
-        const j = i * 4;
-        imageData.data[j + 0] = gray[i];
-        imageData.data[j + 1] = gray[i];
-        imageData.data[j + 2] = gray[i];
-        imageData.data[j + 3] = 255;
+      const len = frameSize;
+      const data = buf32; // Cache local reference for speed
+
+      // 32-bit packed loop: writes Red, Green, Blue, and Alpha in one CPU cycle per pixel
+      // Little-Endian (AABBGGRR): Alpha (255) | Blue (val) | Green (val) | Red (val)
+      for (let i = 0; i < len; i++) {
+        const val = gray[i];
+        data[i] = (255 << 24) | (val << 16) | (val << 8) | val;
       }
+
       ctx.putImageData(imageData, 0, 0);
       renderedFrames++;
       fpsFrames++;
-
-      const now = performance.now();
-      const elapsed = now - lastFpsTime;
-      if (elapsed >= 1000) {
-        const fps = (fpsFrames * 1000 / elapsed).toFixed(1);
-        const reqFps = (reqCount * 1000 / elapsed).toFixed(1);
-        statusEl.textContent = `Frames: ${renderedFrames} | drawFPS: ${fps} | reqFPS: ${reqFps} | fmt: ${lastFrameFormat} | stale: ${staleFrames} | discard: ${discardedFrames} | age: ${lastAgeMs}ms | net: ${lastFetchMs.toFixed(1)}ms | decode: ${lastDecodeMs.toFixed(1)}ms | draw: ${lastDrawMs.toFixed(1)}ms | len: ${lastFrameLen} | poll: ${pollDelayMs}ms`;
-        fpsFrames = 0;
-        reqCount = 0;
-        lastFpsTime = now;
-      }
+      updateStats();
     }
 
     async function drawJpegFrame(buffer) {
@@ -132,20 +153,44 @@ static const char *INDEX_HTML = R"rawliteral(
       renderedFrames++;
       fpsFrames++;
       lastDrawMs = performance.now() - drawStart;
+      updateStats();
+    }
+
+    function updateStats() {
+      const now = performance.now();
+      const elapsed = now - lastFpsTime;
+      if (elapsed >= 1000) {
+        const fps = (fpsFrames * 1000 / elapsed).toFixed(1);
+        const reqFps = (reqCount * 1000 / elapsed).toFixed(1);
+        statusEl.textContent = `Frames: ${renderedFrames} | drawFPS: ${fps} | reqFPS: ${reqFps} | fmt: ${lastFrameFormat} | stale: ${staleFrames} | discard: ${discardedFrames} | age: ${lastAgeMs}ms | net: ${lastFetchMs.toFixed(1)}ms | decode: ${lastDecodeMs.toFixed(1)}ms | draw: ${lastDrawMs.toFixed(1)}ms | len: ${lastFrameLen}`;
+        fpsFrames = 0;
+        reqCount = 0;
+        lastFpsTime = now;
+      }
     }
 
     async function pollFrames() {
+      // 1. Skip polling if tab is in the background or a request is already running
+      if (isFetching || document.hidden) {
+        requestAnimationFrame(pollFrames);
+        return;
+      }
+
+      isFetching = true;
+
       try {
         const reqStart = performance.now();
         const freezeValue = freezeToggle.checked ? '1' : '0';
+        
         const response = await fetch(`/capture.rgb?ts=${Date.now()}&freeze=${freezeValue}`, { cache: 'no-store' });
-        const respReady = performance.now();
         reqCount++;
-        lastFetchMs = respReady - reqStart;
+        lastFetchMs = performance.now() - reqStart;
+
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}`);
         }
 
+        // Header Extraction
         const seqHeader = response.headers.get('X-Frame-Seq');
         const ageHeader = response.headers.get('X-Frame-Age-Ms');
         const lenHeader = response.headers.get('X-Frame-Len');
@@ -153,13 +198,16 @@ static const char *INDEX_HTML = R"rawliteral(
         const contentType = response.headers.get('Content-Type') || '';
         const widthHeader = response.headers.get('X-Frame-Width');
         const heightHeader = response.headers.get('X-Frame-Height');
+
         const seq = seqHeader ? Number(seqHeader) : -1;
         lastAgeMs = ageHeader ? Number(ageHeader) : 0;
         lastFrameLen = lenHeader ? Number(lenHeader) : 0;
         lastFrameFormat = formatHeader || (contentType.includes('image/jpeg') ? 'jpeg' : 'gray8');
+        
         const frameWidth = widthHeader ? Number(widthHeader) : width;
         const frameHeight = heightHeader ? Number(heightHeader) : height;
         ensureCanvasSize(frameWidth, frameHeight);
+
         if (seq >= 0) {
           if (lastSeq >= 0 && seq === lastSeq) {
             staleFrames++;
@@ -167,39 +215,42 @@ static const char *INDEX_HTML = R"rawliteral(
           lastSeq = seq;
         }
 
-        const decodeStart = performance.now();
+        // Processing Payload
         const buffer = await response.arrayBuffer();
         const bytes = new Uint8Array(buffer);
         const looksLikeJpeg = bytes.length >= 2 && bytes[0] === 0xFF && bytes[1] === 0xD8;
         const treatAsJpeg = (lastFrameFormat === 'jpeg') || looksLikeJpeg;
+
         if (treatAsJpeg) {
           lastFrameFormat = 'jpeg';
           await drawJpegFrame(buffer);
           errorCount = 0;
         } else {
+          const decodeStart = performance.now();
           lastDecodeMs = performance.now() - decodeStart;
-          const gray = bytes;
-          if (gray.length >= frameSize) {
+          if (bytes.length >= frameSize) {
             const drawStart = performance.now();
-            drawGrayFrame(gray.subarray(0, frameSize));
+            drawGrayFrame(bytes.subarray(0, frameSize));
             lastDrawMs = performance.now() - drawStart;
             errorCount = 0;
           } else {
             discardedFrames++;
-            throw new Error(`short frame: ${gray.length}`);
+            throw new Error(`short frame: ${bytes.length}`);
           }
         }
       } catch (err) {
         errorCount++;
         console.error(err);
-        statusEl.textContent = `Waiting for frames... (${errorCount}) ${err && err.message ? err.message : ''}`;
+        statusEl.textContent = `Waiting for frames... (${errorCount}) ${err.message || ''}`;
       } finally {
-        setTimeout(pollFrames, pollDelayMs);
+        isFetching = false;
+        // 2. Loop immediately using screen refresh timing (up to 60fps+)
+        requestAnimationFrame(pollFrames);
       }
     }
 
     statusEl.textContent = 'Connecting capture...';
-    pollFrames();
+    requestAnimationFrame(pollFrames);
   </script>
 </body>
 </html>
