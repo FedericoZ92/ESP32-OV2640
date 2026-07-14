@@ -53,6 +53,7 @@ static volatile uint8_t activeHttpFrameIndex = 0;
 static volatile size_t activeHttpFrameLen = 0;
 static volatile uint16_t activeHttpFrameWidth = TF_IMAGE_INPUT_SIZE;
 static volatile uint16_t activeHttpFrameHeight = TF_IMAGE_INPUT_SIZE;
+static volatile pixformat_t activeHttpFrameFormat = PIXFORMAT_GRAYSCALE;
 static volatile uint32_t activeHttpFrameSeq = 0;
 static volatile int64_t activeHttpFramePublishUs = 0;
 static volatile bool pauseCameraAcquisition = false;
@@ -62,11 +63,9 @@ uint8_t *rawImageBuffer = nullptr; // raw pixels
 uint8_t* tflitePreEditingBuffer = nullptr; // default: raw buffer
 static uint8_t tfliteGray96x96InputBuffer[TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE];
 
-#if STREAM_ORIGINALLY_ACQUIRED_IMAGE
-    static constexpr size_t kPublishedFrameMaxBytes = 160 * 120; // QQVGA grayscale
-#else
-    static constexpr size_t kPublishedFrameMaxBytes = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE;
-#endif
+// Large enough for QQVGA grayscale and typical QQVGA JPEG payloads.
+static constexpr size_t kPublishedFrameMaxBytes =
+    (JPEG_BUFFER_SIZE > (160 * 120) ? JPEG_BUFFER_SIZE : (160 * 120));
 
 // Background task: capture and process frames continuously
 void capture_task(void *arg)
@@ -164,8 +163,16 @@ void capture_task(void *arg)
             size_t publishLen = 0;
             uint16_t publishWidth = TF_IMAGE_INPUT_SIZE;
             uint16_t publishHeight = TF_IMAGE_INPUT_SIZE;
+            pixformat_t publishFormat = PIXFORMAT_GRAYSCALE;
 
-            #if STREAM_ORIGINALLY_ACQUIRED_IMAGE
+            if (frameBuffer->format == PIXFORMAT_JPEG) {
+                publishSrc = frameBuffer->buf;
+                publishLen = frameBuffer->len;
+                publishWidth = frameBuffer->width;
+                publishHeight = frameBuffer->height;
+                publishFormat = PIXFORMAT_JPEG;
+            } else {
+                #if STREAM_ORIGINALLY_ACQUIRED_IMAGE
                 if (frameBuffer->format == PIXFORMAT_GRAYSCALE) {
                     publishSrc = tflitePreEditingBuffer;
                     publishLen = (size_t)frameBuffer->width * (size_t)frameBuffer->height;
@@ -176,10 +183,11 @@ void capture_task(void *arg)
                     publishSrc = tfliteGray96x96InputBuffer;
                     publishLen = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE;
                 }
-            #else
+                #else
                 publishSrc = tfliteGray96x96InputBuffer;
                 publishLen = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE;
-            #endif
+                #endif
+            }
 
             if (publishLen > frameBufferSize) {
                 ESP_LOGW(CAPTURE_TAG,
@@ -197,6 +205,7 @@ void capture_task(void *arg)
                 activeHttpFrameLen = publishLen;
                 activeHttpFrameWidth = publishWidth;
                 activeHttpFrameHeight = publishHeight;
+                activeHttpFrameFormat = publishFormat;
                 activeHttpFrameIndex = publishIndex;
                 activeHttpFrameSeq++;
                 activeHttpFramePublishUs = nowUs;
@@ -256,7 +265,7 @@ void capture_task(void *arg)
     }
 }
 
-// HTTP handler — returns the latest captured grayscale frame
+// HTTP handler — returns the latest captured frame payload
 esp_err_t captureRgbCallback(httpd_req_t *req)
 {
     const int64_t reqStartUs = esp_timer_get_time();
@@ -294,6 +303,7 @@ esp_err_t captureRgbCallback(httpd_req_t *req)
     uint8_t frameIndex = 0;
     uint16_t frameWidth = TF_IMAGE_INPUT_SIZE;
     uint16_t frameHeight = TF_IMAGE_INPUT_SIZE;
+    pixformat_t frameFormat = PIXFORMAT_GRAYSCALE;
     uint32_t frameSeq = 0;
     int64_t framePublishUs = 0;
     taskENTER_CRITICAL(&httpFrameMetaLock);
@@ -301,9 +311,16 @@ esp_err_t captureRgbCallback(httpd_req_t *req)
     frameIndex = activeHttpFrameIndex;
     frameWidth = activeHttpFrameWidth;
     frameHeight = activeHttpFrameHeight;
+    frameFormat = activeHttpFrameFormat;
     frameSeq = activeHttpFrameSeq;
     framePublishUs = activeHttpFramePublishUs;
     taskEXIT_CRITICAL(&httpFrameMetaLock);
+
+    if (frameFormat == PIXFORMAT_JPEG) {
+        httpd_resp_set_type(req, "image/jpeg");
+    } else {
+        httpd_resp_set_type(req, "application/octet-stream");
+    }
 
     // Expose frame telemetry in HTTP headers for browser-side diagnostics.
     char seqBuf[16];
@@ -327,6 +344,8 @@ esp_err_t captureRgbCallback(httpd_req_t *req)
     char heightBuf[8];
     snprintf(heightBuf, sizeof(heightBuf), "%u", (unsigned int)frameHeight);
     httpd_resp_set_hdr(req, "X-Frame-Height", heightBuf);
+
+    httpd_resp_set_hdr(req, "X-Frame-Format", (frameFormat == PIXFORMAT_JPEG) ? "jpeg" : "gray8");
 
     if (httpReqWindowStartUs == 0) {
         httpReqWindowStartUs = nowUs;

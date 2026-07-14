@@ -78,6 +78,7 @@ static const char *INDEX_HTML = R"rawliteral(
     let lastDecodeMs = 0;
     let lastDrawMs = 0;
     let lastFrameLen = 0;
+    let lastFrameFormat = 'gray8';
     let reqCount = 0;
     let lastFpsTime = performance.now();
     let fpsFrames = 0;
@@ -111,11 +112,26 @@ static const char *INDEX_HTML = R"rawliteral(
       if (elapsed >= 1000) {
         const fps = (fpsFrames * 1000 / elapsed).toFixed(1);
         const reqFps = (reqCount * 1000 / elapsed).toFixed(1);
-        statusEl.textContent = `Frames: ${renderedFrames} | drawFPS: ${fps} | reqFPS: ${reqFps} | stale: ${staleFrames} | discard: ${discardedFrames} | age: ${lastAgeMs}ms | net: ${lastFetchMs.toFixed(1)}ms | decode: ${lastDecodeMs.toFixed(1)}ms | draw: ${lastDrawMs.toFixed(1)}ms | len: ${lastFrameLen} | poll: ${pollDelayMs}ms`;
+        statusEl.textContent = `Frames: ${renderedFrames} | drawFPS: ${fps} | reqFPS: ${reqFps} | fmt: ${lastFrameFormat} | stale: ${staleFrames} | discard: ${discardedFrames} | age: ${lastAgeMs}ms | net: ${lastFetchMs.toFixed(1)}ms | decode: ${lastDecodeMs.toFixed(1)}ms | draw: ${lastDrawMs.toFixed(1)}ms | len: ${lastFrameLen} | poll: ${pollDelayMs}ms`;
         fpsFrames = 0;
         reqCount = 0;
         lastFpsTime = now;
       }
+    }
+
+    async function drawJpegFrame(buffer) {
+      const decodeStart = performance.now();
+      const blob = new Blob([buffer], { type: 'image/jpeg' });
+      const bitmap = await createImageBitmap(blob);
+      lastDecodeMs = performance.now() - decodeStart;
+
+      ensureCanvasSize(bitmap.width, bitmap.height);
+      const drawStart = performance.now();
+      ctx.drawImage(bitmap, 0, 0, width, height);
+      bitmap.close();
+      renderedFrames++;
+      fpsFrames++;
+      lastDrawMs = performance.now() - drawStart;
     }
 
     async function pollFrames() {
@@ -133,11 +149,13 @@ static const char *INDEX_HTML = R"rawliteral(
         const seqHeader = response.headers.get('X-Frame-Seq');
         const ageHeader = response.headers.get('X-Frame-Age-Ms');
         const lenHeader = response.headers.get('X-Frame-Len');
+        const formatHeader = response.headers.get('X-Frame-Format');
         const widthHeader = response.headers.get('X-Frame-Width');
         const heightHeader = response.headers.get('X-Frame-Height');
         const seq = seqHeader ? Number(seqHeader) : -1;
         lastAgeMs = ageHeader ? Number(ageHeader) : 0;
         lastFrameLen = lenHeader ? Number(lenHeader) : 0;
+        lastFrameFormat = formatHeader || 'gray8';
         const frameWidth = widthHeader ? Number(widthHeader) : width;
         const frameHeight = heightHeader ? Number(heightHeader) : height;
         ensureCanvasSize(frameWidth, frameHeight);
@@ -150,16 +168,21 @@ static const char *INDEX_HTML = R"rawliteral(
 
         const decodeStart = performance.now();
         const buffer = await response.arrayBuffer();
-        lastDecodeMs = performance.now() - decodeStart;
-        const gray = new Uint8Array(buffer);
-        if (gray.length >= frameSize) {
-          const drawStart = performance.now();
-          drawGrayFrame(gray.subarray(0, frameSize));
-          lastDrawMs = performance.now() - drawStart;
+        if (lastFrameFormat === 'jpeg') {
+          await drawJpegFrame(buffer);
           errorCount = 0;
         } else {
-          discardedFrames++;
-          throw new Error(`short frame: ${gray.length}`);
+          lastDecodeMs = performance.now() - decodeStart;
+          const gray = new Uint8Array(buffer);
+          if (gray.length >= frameSize) {
+            const drawStart = performance.now();
+            drawGrayFrame(gray.subarray(0, frameSize));
+            lastDrawMs = performance.now() - drawStart;
+            errorCount = 0;
+          } else {
+            discardedFrames++;
+            throw new Error(`short frame: ${gray.length}`);
+          }
         }
       } catch (err) {
         errorCount++;
