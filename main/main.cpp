@@ -951,14 +951,14 @@ extern "C" void app_main(void)
     ESP_LOGI(OV2640_TAG, "Started periodic capture task");
 
     // --- Optional: run for a limited time, then reboot ---
-    char buffer[1024]; 
+    /*char buffer[1024]; 
     for (int i = 0; i < 30; i++) { // log task stats every 5 seconds for 25 seconds
         vTaskGetRunTimeStats(buffer);
         printf("Task Name\tRun Time\tCPU %%\n");
         printf("%s\n", buffer);
         vTaskDelay(pdMS_TO_TICKS(1000 * 10)); //10 sec 
-    }
+    }*/
 
-    ESP_LOGW(OV2640_TAG, "Rebooting system...");
-    esp_restart();
+    //ESP_LOGW(OV2640_TAG, "Rebooting system...");
+    //esp_restart();
 }
