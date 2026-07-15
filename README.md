@@ -121,6 +121,36 @@ The project uses default settings. You can modify `sdkconfig` or use `idf.py men
 
 For technical queries, please refer to the [ESP-IDF documentation](https://docs.espressif.com/projects/esp-idf/) or open an issue on the project repository.
 
-## License
 
-This project is licensed under the MIT License. See the LICENSE file for details.
+### Pipeline, software objects and parameters
+
+# 1. Camera Capture and Preprocessing Loop
+
+* **Acquisition:** The `capture_task` (running on Core 1) continuously pulls a raw frame buffer (`camera_fb_t`) from the hardware driver using `esp_camera_fb_get()`.
+
+* **Decoding and Formatting:** If the camera is set to output JPEG, the chip performs a software decompression via `allocatingDecodeCameraJpeg` into a raw RGB565 format in external memory. It then converts the pixels to grayscale (`convertRgb565ToGrayscale`) and crops the center down to a 96x96 window (`tfliteGray96x96InputBuffer`).
+
+* **Double-Buffering Architecture:** To prevent the web server from reading a frame while the camera is actively writing to it, the system utilizes two static frame buffers (`httpFrameBuffers[2]`) allocated in PSRAM, restricted to a maximum size of `kPublishedFrameMaxBytes`.
+
+* **Atomic Metadata Swap:** Once a new frame is copied into the inactive buffer, the application enters a critical section lock using `httpFrameMetaLock` to instantly update active variables like length, width, height, format, sequence ID, and the publication timestamp.
+
+# 2. Network Transport & HTTP Server
+
+* **Server Configurations:** The network layer initiates the HTTP server on Core 0 via `CameraHttpServer::start`. It configures the engine using `HTTPD_DEFAULT_CONFIG()` while manually forcing `keep_alive_enable = true` and setting `max_open_sockets = 7` to handle concurrent connections.
+
+* **Data Transmission Pipelines:** Depending on your preprocessor macros, the system streams the active data buffer using one of three methods:
+* **HTTP Polling (`/capture.rgb`):** The client browser requests frames repeatedly. The server responds with an octet-stream or JPEG payload and injects custom tracking telemetry (`X-Frame-Seq`, `X-Frame-Age-Ms`, `X-Frame-Len`) straight into the HTTP headers.
+
+* **HTTP Multipart Stream (`/stream.rgb`):** The server holds a single TCP connection open indefinitely, continuously pushing back-to-back frames separated by a multipart chunk boundary string.
+
+* **UDP Stream (`udp_stream_task`):** The application bypasses HTTP entirely, splitting the active memory buffer into packet blocks up to `UDP_STREAM_MAX_PAYLOAD` bytes. It prefixes each block with a custom `UdpFrameHeader` packet (tracking magic bytes, chunk index, and frame age) and pushes them over raw sockets via `sendto` on `UDP_STREAM_PORT`.
+
+* **Wi-Fi Radio Optimization:** To ensure the radio does not drop packets or introduce latency spikes during network transactions, the `WifiManager` explicitly disables Wi-Fi power saving by setting `esp_wifi_set_ps(WIFI_PS_NONE)`.
+
+# 3. Core Network Parameters (TCP Window & LWIP Mailbox)
+
+* **TCP Window Size:** There is no configuration or reference to TCP window sizes anywhere within your application source code.
+
+* **LWIP Mailbox Queue Sizes:** Mailbox or queue depths for the network stack are completely absent from these files.
+
+* **Where They Exist:** Both the TCP Window size and the LWIP mailbox parameters are managed implicitly by the default settings of the underlying ESP-IDF SDK framework. To change them, you must adjust them through the ESP-IDF interactive project configuration utility (`menuconfig`), as they cannot be manipulated from this project's code files.
