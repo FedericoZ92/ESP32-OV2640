@@ -173,7 +173,7 @@ void capture_task(void *arg)
                 publishHeight = frameBuffer->height;
                 publishFormat = PIXFORMAT_JPEG;
             } else {
-                #if ENABLE_INFERENCE
+                //#if ENABLE_INFERENCE
                     #if STREAM_ORIGINALLY_ACQUIRED_IMAGE
                     if (frameBuffer->format == PIXFORMAT_GRAYSCALE) {
                         publishSrc = tflitePreEditingBuffer;
@@ -189,7 +189,7 @@ void capture_task(void *arg)
                         publishSrc = tfliteGray96x96InputBuffer;
                         publishLen = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE;
                     #endif
-                #endif
+                //#endif
             }
 
             if (publishLen > frameBufferSize) {
