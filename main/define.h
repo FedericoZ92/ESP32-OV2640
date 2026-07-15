@@ -1,5 +1,9 @@
 #pragma once
 
+// Core ID for the HTTP server task. Set to 0 or 1 depending on your ESP32 core preference.
+// Purpose: offloading the web server to Core 1 while keeping the Wi-Fi controller and interrupts on Core 0
+#define CORE_ID_HTTP_SERVER 1
+
 //IMAGE FORMAT FOR INFERENCE
 #define IMAGE_FRAME_SIZE_FOR_INFERENCE FRAMESIZE_QQVGA //FRAMESIZE_QVGA; //used with inference
 

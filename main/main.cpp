@@ -921,7 +921,7 @@ extern "C" void app_main(void)
         NULL,
         5,
         NULL,
-        0
+        CORE_ID_HTTP_SERVER
     );
 
     #if USE_UDP
