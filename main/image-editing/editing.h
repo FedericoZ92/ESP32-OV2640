@@ -1,4 +1,5 @@
 #pragma once
+#include <stdbool.h>
 #include <stdint.h>
 #include <esp_camera.h>
 
@@ -22,12 +23,12 @@ void convertRgb565ToGrayscale(const uint16_t* rgb565,
                                 int width, 
                                 int height);
 
-void cropCenter(uint8_t* src, 
-                int src_width, 
-                int src_height, 
-                uint8_t* dst, 
-                int crop_width, 
-                int crop_height, 
+bool cropCenter(const uint8_t* src,
+                int src_width,
+                int src_height,
+                uint8_t* dst,
+                int crop_width,
+                int crop_height,
                 int channels);
 
 uint8_t* allocatingDecodeCameraJpeg(camera_fb_t *fb, 

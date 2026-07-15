@@ -43,9 +43,18 @@ void convertRgb888ToGrayscale(const uint8_t* rgb, uint8_t* gray, int width, int 
     }
 }
 
-void cropCenter(uint8_t* src, int src_width, int src_height, 
+bool cropCenter(const uint8_t* src, int src_width, int src_height,
                 uint8_t* dst, int crop_width, int crop_height, int channels)
 {
+    if (!src || !dst || src_width <= 0 || src_height <= 0 ||
+        crop_width <= 0 || crop_height <= 0 || channels <= 0) {
+        return false;
+    }
+
+    if (crop_width > src_width || crop_height > src_height) {
+        return false;
+    }
+
     // Calculate top-left corner of the crop region
     int start_x = (src_width  - crop_width)  / 2;
     int start_y = (src_height - crop_height) / 2;
@@ -59,6 +68,8 @@ void cropCenter(uint8_t* src, int src_width, int src_height,
         uint8_t* dst_row = dst + (y * crop_width) * channels;
         memcpy(dst_row, src_row, crop_width * channels);
     }
+
+    return true;
 }
 
 uint8_t* allocatingDecodeCameraJpeg(camera_fb_t *fb, 

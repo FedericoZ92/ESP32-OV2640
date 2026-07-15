@@ -103,35 +103,36 @@ void capture_task(void *arg)
         cameraAcquisitionTimer.logCheckpoint(CAPTURE_TAG, "frame captured");
     
         // ---
-
-        // --- Handle JPEG decoding to raw frame ---
-        ESP_LOGD(CAPTURE_TAG, "Handle JPEG decoding to raw frame"); 
-        jpegTimer.checkpoint();
-        // Free previous decoded buffer
-        if (rawImageBuffer) {
-            heap_caps_free(rawImageBuffer);
-            rawImageBuffer = nullptr;
-        }
-        if (frameBuffer->format == PIXFORMAT_JPEG) {
-            rawImageBuffer = allocatingDecodeCameraJpeg(frameBuffer, 
-                                                        MALLOC_CAP_SPIRAM, 
-                                                        JPEG_IMAGE_FORMAT_RGB565,
-                                                        JPEG_IMAGE_SCALE_0);
-            if (!rawImageBuffer) {
-                ESP_LOGE(CAPTURE_TAG, "JPEG decode failed");
+        #if ENABLE_INFERENCE
+            // --- Handle JPEG decoding to raw frame ---
+            ESP_LOGD(CAPTURE_TAG, "Handle JPEG decoding to raw frame"); 
+            jpegTimer.checkpoint();
+            // Free previous decoded buffer
+            if (rawImageBuffer) {
+                heap_caps_free(rawImageBuffer);
+                rawImageBuffer = nullptr;
+            }
+            if (frameBuffer->format == PIXFORMAT_JPEG) {
+                rawImageBuffer = allocatingDecodeCameraJpeg(frameBuffer, 
+                                                            MALLOC_CAP_SPIRAM, 
+                                                            JPEG_IMAGE_FORMAT_RGB565,
+                                                            JPEG_IMAGE_SCALE_0);
+                if (!rawImageBuffer) {
+                    ESP_LOGE(CAPTURE_TAG, "JPEG decode failed");
+                    esp_camera_fb_return(frameBuffer);
+                    continue;
+                }
+                tflitePreEditingBuffer = rawImageBuffer;
+            } else if (frameBuffer->format == PIXFORMAT_GRAYSCALE) {
+                tflitePreEditingBuffer = frameBuffer->buf;
+            } else {
+                ESP_LOGW(CAPTURE_TAG, "Unsupported pixel format %d", frameBuffer->format);
                 esp_camera_fb_return(frameBuffer);
+                vTaskDelay(pdMS_TO_TICKS(100));
                 continue;
             }
-            tflitePreEditingBuffer = rawImageBuffer;
-        } else if (frameBuffer->format == PIXFORMAT_GRAYSCALE) {
-            tflitePreEditingBuffer = frameBuffer->buf;
-        } else {
-            ESP_LOGW(CAPTURE_TAG, "Unsupported pixel format %d", frameBuffer->format);
-            esp_camera_fb_return(frameBuffer);
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
-        }
-        jpegTimer.logCheckpoint(JPEG_TAG, "raw to jpeg conversion done");
+            jpegTimer.logCheckpoint(JPEG_TAG, "raw to jpeg conversion done");
+        #endif
         // ---
 
         // --- TensorFlow Lite inference ---
@@ -172,20 +173,22 @@ void capture_task(void *arg)
                 publishHeight = frameBuffer->height;
                 publishFormat = PIXFORMAT_JPEG;
             } else {
-                #if STREAM_ORIGINALLY_ACQUIRED_IMAGE
-                if (frameBuffer->format == PIXFORMAT_GRAYSCALE) {
-                    publishSrc = tflitePreEditingBuffer;
-                    publishLen = (size_t)frameBuffer->width * (size_t)frameBuffer->height;
-                    publishWidth = frameBuffer->width;
-                    publishHeight = frameBuffer->height;
-                } else {
-                    // Fallback to 96x96 stream for non-grayscale capture modes.
-                    publishSrc = tfliteGray96x96InputBuffer;
-                    publishLen = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE;
-                }
-                #else
-                publishSrc = tfliteGray96x96InputBuffer;
-                publishLen = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE;
+                #if ENABLE_INFERENCE
+                    #if STREAM_ORIGINALLY_ACQUIRED_IMAGE
+                    if (frameBuffer->format == PIXFORMAT_GRAYSCALE) {
+                        publishSrc = tflitePreEditingBuffer;
+                        publishLen = (size_t)frameBuffer->width * (size_t)frameBuffer->height;
+                        publishWidth = frameBuffer->width;
+                        publishHeight = frameBuffer->height;
+                    } else {
+                        // Fallback to 96x96 stream for non-grayscale capture modes.
+                        publishSrc = tfliteGray96x96InputBuffer;
+                        publishLen = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE;
+                    }
+                    #else
+                        publishSrc = tfliteGray96x96InputBuffer;
+                        publishLen = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE;
+                    #endif
                 #endif
             }
 
@@ -810,7 +813,7 @@ void udp_stream_task(void *arg)
 
 extern "C" void app_main(void)
 {
-    esp_log_level_set("*", ESP_LOG_INFO);
+    esp_log_level_set("*", ESP_LOG_WARN);
 
     // --- Print chip info ---
     esp_chip_info_t chip_info;
