@@ -22,6 +22,7 @@
 #include "image-editing/editing.h"
 #include "led/rgb-led.h"
 #include "led/red-led.h"
+#include "app-globals.h"
 #include "psram/psram.h"
 #include "network.h"
 #include "checkpoint-timer/checkpoint-timer.h"
@@ -507,62 +508,7 @@ void stream_publish_task(void *arg)
     }
 }
 
-#if ENABLE_INFERENCE
-void inference_task(void *arg)
-{
-    ESP_LOGI(TF_TAG, "Inference task started");
 
-    uint8_t* grayscaleWorkspace = (uint8_t*)heap_caps_malloc(kAcquiredFrameMaxPixels, MALLOC_CAP_8BIT);
-    uint8_t* gray96Buffer = (uint8_t*)heap_caps_malloc(TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE, MALLOC_CAP_8BIT);
-    if (!grayscaleWorkspace || !gray96Buffer) {
-        ESP_LOGE(TF_TAG, "Failed to allocate inference workspace");
-        vTaskDelete(NULL);
-        return;
-    }
-
-    uint32_t lastSeenSeq = 0;
-
-    while (true) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
-        FrameSnapshot snapshot = {};
-        if (!snapshotMailbox(&inferenceMailbox, &snapshot) || snapshot.seq == lastSeenSeq) {
-            continue;
-        }
-
-        tensorFlowTimer.checkpoint();
-        jpegTimer.checkpoint();
-        const bool prepared = buildGray96Frame(snapshot,
-                                               grayscaleWorkspace,
-                                               kAcquiredFrameMaxPixels,
-                                               gray96Buffer);
-        jpegTimer.logCheckpoint(JPEG_TAG, "inference input prepared");
-        if (!prepared) {
-            lastSeenSeq = snapshot.seq;
-            continue;
-        }
-
-        TfLiteTensor* input = tf_wrapper.getInputTensor();
-        if (input && input->dims && input->dims->size >= 4) {
-            logFirstPixels(TF_TAG, "gray96Buffer", gray96Buffer, 10);
-            bool person_present = tf_wrapper.runInference(gray96Buffer, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE);
-            ESP_LOGW(TF_TAG, "Person detected? %s", person_present ? "YES" : "NO");
-            if (person_present) {
-                redLed.setLedGpio2(0);
-                rgb.turnBlueLedOn();
-            } else {
-                redLed.setLedGpio2(1);
-                rgb.turnRedLedOn();
-            }
-        } else {
-            ESP_LOGE(TF_TAG, "Input tensor is null or malformed");
-        }
-
-        tensorFlowTimer.logCheckpoint(TF_TAG, "tf inference done");
-        lastSeenSeq = snapshot.seq;
-    }
-}
-#endif
 
 // HTTP handler — returns the latest captured frame payload
 esp_err_t captureRgbCallback(httpd_req_t *req)
@@ -816,7 +762,7 @@ esp_err_t captureRgbCallback(httpd_req_t *req)
 }
 
 // HTTP handler — keeps one connection open and streams frames continuously.
-esp_err_t streamRgbCallback(httpd_req_t *req)
+esp_err_t streamTcpRgbCallback(httpd_req_t *req)
 {
     esp_err_t res = ESP_OK;
     char *part_buf = (char*)malloc(256);
@@ -1214,7 +1160,7 @@ extern "C" void app_main(void)
     auto http_server_task = [](void* arg) {
         #if USE_TCP
             server.setCaptureHandler(captureRgbCallback);
-            server.setStreamHandler(streamRgbCallback);
+            server.setStreamHandler(streamTcpRgbCallback);
         #endif
 
         if (server.start() == ESP_OK) {
@@ -1269,7 +1215,7 @@ extern "C" void app_main(void)
 
     #if ENABLE_INFERENCE
         xTaskCreatePinnedToCore(
-            inference_task,
+            [](void* arg) { tf_wrapper.inference_task(arg); },
             "inference_task",
             6144,
             NULL,

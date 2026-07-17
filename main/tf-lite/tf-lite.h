@@ -31,6 +31,8 @@ public:
     uint8_t* getOutputDataUint8() const;
     TfLiteTensor* getInputTensor();
 
+    void inference_task(void *arg);
+
 private:
     const tflite::Model* model = nullptr;
     tflite::MicroInterpreter* interpreter = nullptr;

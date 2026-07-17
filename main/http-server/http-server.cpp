@@ -1,5 +1,6 @@
 #include "http-server/http-server.h"
 #include "define.h"
+#include "app-globals.h"
 
 CameraHttpServer::CaptureCallback CameraHttpServer::s_captureCallback = nullptr;
 CameraHttpServer::StreamCallback CameraHttpServer::s_streamCallback = nullptr;
