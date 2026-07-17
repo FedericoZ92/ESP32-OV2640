@@ -4,6 +4,10 @@
 // Purpose: offloading the web server to Core 1 while keeping the Wi-Fi controller and interrupts on Core 0
 #define CORE_ID_HTTP_SERVER 1
 
+// Pipeline task toggles. Capture feeds the optional inference and stream-publication tasks.
+#define ENABLE_CAMERA_ACQUISITION_TASK 1
+#define ENABLE_RGB_STREAM_TASK 1
+
 //IMAGE FORMAT FOR INFERENCE
 #define IMAGE_FRAME_SIZE_FOR_INFERENCE FRAMESIZE_QQVGA //FRAMESIZE_QVGA; //used with inference
 
@@ -41,6 +45,10 @@
 
 #if ((USE_TCP + USE_UDP) != 1)
     #error "Invalid transport config: set exactly one of USE_TCP or USE_UDP to 1"
+#endif
+
+#if (!ENABLE_CAMERA_ACQUISITION_TASK && (ENABLE_RGB_STREAM_TASK || ENABLE_INFERENCE))
+    #error "Capture task must be enabled when stream or inference tasks are enabled"
 #endif
 
 // JavaScript-compatible boolean string derived from ENABLE_POLLING_FALLBACK.

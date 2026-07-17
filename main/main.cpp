@@ -59,29 +59,295 @@ static volatile int64_t activeHttpFramePublishUs = 0;
 static volatile bool pauseCameraAcquisition = false;
 static portMUX_TYPE httpFrameMetaLock = portMUX_INITIALIZER_UNLOCKED;
 static TfLiteWrapper tf_wrapper;
-uint8_t *rawImageBuffer = nullptr; // raw pixels
-uint8_t* tflitePreEditingBuffer = nullptr; // default: raw buffer
-static uint8_t tfliteGray96x96InputBuffer[TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE];
 
 // Large enough for QQVGA grayscale and worst-case QQVGA JPEG payload bursts.
 static constexpr size_t kPublishedFrameMaxBytes =
     (JPEG_BUFFER_SIZE > (160 * 120 * 2) ? JPEG_BUFFER_SIZE : (160 * 120 * 2));
 
-// Background task: capture and process frames continuously
+// The current inference camera mode is QQVGA, so a full grayscale scratch frame fits here.
+static constexpr size_t kAcquiredFrameMaxPixels = 160 * 120;
+
+struct FrameMailbox {
+    uint8_t* buffers[2] = {nullptr, nullptr};
+    volatile uint8_t activeIndex = 0;
+    volatile size_t frameLen = 0;
+    volatile uint16_t frameWidth = 0;
+    volatile uint16_t frameHeight = 0;
+    volatile pixformat_t frameFormat = PIXFORMAT_GRAYSCALE;
+    volatile uint32_t frameSeq = 0;
+    volatile int64_t frameCaptureUs = 0;
+    portMUX_TYPE lock = portMUX_INITIALIZER_UNLOCKED;
+    TaskHandle_t consumerTaskHandle = nullptr;
+    const char* tag = nullptr;
+};
+
+struct FrameSnapshot {
+    const uint8_t* data = nullptr;
+    size_t len = 0;
+    uint16_t width = 0;
+    uint16_t height = 0;
+    pixformat_t format = PIXFORMAT_GRAYSCALE;
+    uint32_t seq = 0;
+    int64_t captureUs = 0;
+};
+
+static FrameMailbox inferenceMailbox;
+static FrameMailbox streamMailbox;
+
+static bool initFrameMailbox(FrameMailbox* mailbox, const char* tag)
+{
+    if (!mailbox) {
+        return false;
+    }
+
+    mailbox->tag = tag;
+    mailbox->buffers[0] = (uint8_t*)heap_caps_malloc(kPublishedFrameMaxBytes, MALLOC_CAP_SPIRAM);
+    mailbox->buffers[1] = (uint8_t*)heap_caps_malloc(kPublishedFrameMaxBytes, MALLOC_CAP_SPIRAM);
+    if (!mailbox->buffers[0] || !mailbox->buffers[1]) {
+        ESP_LOGE(MAIN_TAG, "Failed to allocate mailbox buffers for %s", tag ? tag : "unknown");
+        return false;
+    }
+
+    mailbox->activeIndex = 0;
+    mailbox->frameLen = 0;
+    mailbox->frameWidth = 0;
+    mailbox->frameHeight = 0;
+    mailbox->frameFormat = PIXFORMAT_GRAYSCALE;
+    mailbox->frameSeq = 0;
+    mailbox->frameCaptureUs = 0;
+    mailbox->consumerTaskHandle = nullptr;
+    return true;
+}
+
+static bool initPublishedHttpFrameStore()
+{
+    httpFrameBuffers[0] = (uint8_t*)heap_caps_malloc(kPublishedFrameMaxBytes, MALLOC_CAP_SPIRAM);
+    httpFrameBuffers[1] = (uint8_t*)heap_caps_malloc(kPublishedFrameMaxBytes, MALLOC_CAP_SPIRAM);
+    if (!httpFrameBuffers[0] || !httpFrameBuffers[1]) {
+        ESP_LOGE(MAIN_TAG, "Failed to allocate published HTTP frame buffers");
+        return false;
+    }
+
+    activeHttpFrameLen = 0;
+    activeHttpFrameWidth = TF_IMAGE_INPUT_SIZE;
+    activeHttpFrameHeight = TF_IMAGE_INPUT_SIZE;
+    activeHttpFrameFormat = PIXFORMAT_GRAYSCALE;
+    activeHttpFrameSeq = 0;
+    activeHttpFramePublishUs = 0;
+    return true;
+}
+
+static void publishToMailbox(FrameMailbox* mailbox,
+                             const uint8_t* src,
+                             size_t srcLen,
+                             uint16_t width,
+                             uint16_t height,
+                             pixformat_t format,
+                             int64_t captureUs)
+{
+    if (!mailbox || !src || srcLen == 0) {
+        return;
+    }
+
+    size_t frameLen = srcLen;
+    if (frameLen > kPublishedFrameMaxBytes) {
+        ESP_LOGW(MAIN_TAG,
+                 "Mailbox %s frame too large (%u > %u), truncating",
+                 mailbox->tag ? mailbox->tag : "unknown",
+                 (unsigned int)frameLen,
+                 (unsigned int)kPublishedFrameMaxBytes);
+        frameLen = kPublishedFrameMaxBytes;
+    }
+
+    uint8_t publishIndex = mailbox->activeIndex ^ 1;
+    if (!mailbox->buffers[publishIndex]) {
+        return;
+    }
+
+    memcpy(mailbox->buffers[publishIndex], src, frameLen);
+    taskENTER_CRITICAL(&mailbox->lock);
+    mailbox->frameLen = frameLen;
+    mailbox->frameWidth = width;
+    mailbox->frameHeight = height;
+    mailbox->frameFormat = format;
+    mailbox->activeIndex = publishIndex;
+    mailbox->frameSeq++;
+    mailbox->frameCaptureUs = captureUs;
+    taskEXIT_CRITICAL(&mailbox->lock);
+
+    if (mailbox->consumerTaskHandle) {
+        xTaskNotifyGive(mailbox->consumerTaskHandle);
+    }
+}
+
+static bool snapshotMailbox(FrameMailbox* mailbox, FrameSnapshot* snapshot)
+{
+    if (!mailbox || !snapshot) {
+        return false;
+    }
+
+    taskENTER_CRITICAL(&mailbox->lock);
+    const uint8_t activeIndex = mailbox->activeIndex;
+    snapshot->len = mailbox->frameLen;
+    snapshot->width = mailbox->frameWidth;
+    snapshot->height = mailbox->frameHeight;
+    snapshot->format = mailbox->frameFormat;
+    snapshot->seq = mailbox->frameSeq;
+    snapshot->captureUs = mailbox->frameCaptureUs;
+    taskEXIT_CRITICAL(&mailbox->lock);
+
+    snapshot->data = mailbox->buffers[activeIndex];
+    return snapshot->data != nullptr && snapshot->len > 0;
+}
+
+static void publishHttpFrame(const uint8_t* src,
+                             size_t srcLen,
+                             uint16_t width,
+                             uint16_t height,
+                             pixformat_t format,
+                             int64_t publishUs)
+{
+    if (!src || srcLen == 0) {
+        return;
+    }
+
+    size_t frameLen = srcLen;
+    if (frameLen > kPublishedFrameMaxBytes) {
+        ESP_LOGW(HTTP_TAG,
+                 "Published frame too large (%u > %u), truncating",
+                 (unsigned int)frameLen,
+                 (unsigned int)kPublishedFrameMaxBytes);
+        frameLen = kPublishedFrameMaxBytes;
+    }
+
+    uint8_t publishIndex = activeHttpFrameIndex ^ 1;
+    if (!httpFrameBuffers[publishIndex]) {
+        return;
+    }
+
+    memcpy(httpFrameBuffers[publishIndex], src, frameLen);
+
+    taskENTER_CRITICAL(&httpFrameMetaLock);
+    activeHttpFrameLen = frameLen;
+    activeHttpFrameWidth = width;
+    activeHttpFrameHeight = height;
+    activeHttpFrameFormat = format;
+    activeHttpFrameIndex = publishIndex;
+    activeHttpFrameSeq++;
+    activeHttpFramePublishUs = publishUs;
+    taskEXIT_CRITICAL(&httpFrameMetaLock);
+
+    #if STOP_ACQUISITION_AFTER_1_FRAME
+        if (activeHttpFrameSeq == 1) {
+            pauseCameraAcquisition = true;
+            ESP_LOGW(CAPTURE_TAG, "STOP_ACQUISITION_AFTER_1_FRAME active: acquisition paused after first frame");
+        }
+    #endif
+}
+
+static bool buildGray96Frame(const FrameSnapshot& snapshot,
+                             uint8_t* grayscaleWorkspace,
+                             size_t grayscaleWorkspaceLen,
+                             uint8_t* gray96Buffer)
+{
+    if (!snapshot.data || !grayscaleWorkspace || !gray96Buffer) {
+        return false;
+    }
+
+    if (snapshot.width < TF_IMAGE_INPUT_SIZE || snapshot.height < TF_IMAGE_INPUT_SIZE) {
+        ESP_LOGW(CAPTURE_TAG, "Frame too small to resize to 96x96");
+        return false;
+    }
+
+    const size_t pixelCount = (size_t)snapshot.width * (size_t)snapshot.height;
+    if (pixelCount > grayscaleWorkspaceLen) {
+        ESP_LOGW(CAPTURE_TAG,
+                 "Frame scratch buffer too small (%u > %u)",
+                 (unsigned int)pixelCount,
+                 (unsigned int)grayscaleWorkspaceLen);
+        return false;
+    }
+
+    switch (snapshot.format) {
+        case PIXFORMAT_GRAYSCALE:
+            return cropCenter(snapshot.data,
+                              snapshot.width,
+                              snapshot.height,
+                              gray96Buffer,
+                              TF_IMAGE_INPUT_SIZE,
+                              TF_IMAGE_INPUT_SIZE,
+                              1);
+
+        case PIXFORMAT_RGB565:
+            convertRgb565ToGrayscale((const uint16_t*)snapshot.data,
+                                     grayscaleWorkspace,
+                                     snapshot.width,
+                                     snapshot.height);
+            return cropCenter(grayscaleWorkspace,
+                              snapshot.width,
+                              snapshot.height,
+                              gray96Buffer,
+                              TF_IMAGE_INPUT_SIZE,
+                              TF_IMAGE_INPUT_SIZE,
+                              1);
+
+        case PIXFORMAT_RGB888:
+            convertRgb888ToGrayscale(snapshot.data,
+                                     grayscaleWorkspace,
+                                     snapshot.width,
+                                     snapshot.height);
+            return cropCenter(grayscaleWorkspace,
+                              snapshot.width,
+                              snapshot.height,
+                              gray96Buffer,
+                              TF_IMAGE_INPUT_SIZE,
+                              TF_IMAGE_INPUT_SIZE,
+                              1);
+
+        case PIXFORMAT_JPEG: {
+            camera_fb_t jpegFrame = {};
+            jpegFrame.buf = (uint8_t*)snapshot.data;
+            jpegFrame.len = snapshot.len;
+            jpegFrame.width = snapshot.width;
+            jpegFrame.height = snapshot.height;
+            jpegFrame.format = PIXFORMAT_JPEG;
+
+            uint8_t* decodedRgb565 = allocatingDecodeCameraJpeg(&jpegFrame,
+                                                                 MALLOC_CAP_SPIRAM,
+                                                                 JPEG_IMAGE_FORMAT_RGB565,
+                                                                 JPEG_IMAGE_SCALE_0);
+            if (!decodedRgb565) {
+                ESP_LOGE(CAPTURE_TAG, "JPEG decode failed");
+                return false;
+            }
+
+            convertRgb565ToGrayscale((const uint16_t*)decodedRgb565,
+                                     grayscaleWorkspace,
+                                     snapshot.width,
+                                     snapshot.height);
+            const bool ok = cropCenter(grayscaleWorkspace,
+                                       snapshot.width,
+                                       snapshot.height,
+                                       gray96Buffer,
+                                       TF_IMAGE_INPUT_SIZE,
+                                       TF_IMAGE_INPUT_SIZE,
+                                       1);
+            heap_caps_free(decodedRgb565);
+            return ok;
+        }
+
+        default:
+            ESP_LOGW(CAPTURE_TAG, "Unsupported pixel format %d", snapshot.format);
+            return false;
+    }
+}
+
+// Background task: capture frames and hand them to downstream consumers.
 void capture_task(void *arg)
 {
     ESP_LOGI(CAPTURE_TAG, "Camera capture task started");
-    uint32_t producedFrames = 0;
-    int64_t producerWindowStartUs = esp_timer_get_time();
-    static uint8_t processedFrame[TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE];
-    const size_t frameBufferSize = kPublishedFrameMaxBytes;
-    httpFrameBuffers[0] = (uint8_t*) heap_caps_malloc(frameBufferSize, MALLOC_CAP_SPIRAM);
-    httpFrameBuffers[1] = (uint8_t*) heap_caps_malloc(frameBufferSize, MALLOC_CAP_SPIRAM);
-    if (!httpFrameBuffers[0] || !httpFrameBuffers[1]) {
-        ESP_LOGE(CAPTURE_TAG, "Failed to allocate PSRAM buffer for JPEG frames!");
-        return;
-    }
-    activeHttpFrameLen = 0;
+    uint32_t capturedFrames = 0;
+    int64_t captureWindowStartUs = esp_timer_get_time();
 
     while (true) {
         if (pauseCameraAcquisition) {
@@ -101,165 +367,43 @@ void capture_task(void *arg)
         }
         ESP_LOGD(CAPTURE_TAG, "Frame: %dx%d, len=%d, format=%d", frameBuffer->width, frameBuffer->height, frameBuffer->len, frameBuffer->format);
         cameraAcquisitionTimer.logCheckpoint(CAPTURE_TAG, "frame captured");
-    
-        // ---
-        #if ENABLE_INFERENCE
-            // --- Handle JPEG decoding to raw frame ---
-            ESP_LOGD(CAPTURE_TAG, "Handle JPEG decoding to raw frame"); 
-            jpegTimer.checkpoint();
-            // Free previous decoded buffer
-            if (rawImageBuffer) {
-                heap_caps_free(rawImageBuffer);
-                rawImageBuffer = nullptr;
-            }
-            if (frameBuffer->format == PIXFORMAT_JPEG) {
-                rawImageBuffer = allocatingDecodeCameraJpeg(frameBuffer, 
-                                                            MALLOC_CAP_SPIRAM, 
-                                                            JPEG_IMAGE_FORMAT_RGB565,
-                                                            JPEG_IMAGE_SCALE_0);
-                if (!rawImageBuffer) {
-                    ESP_LOGE(CAPTURE_TAG, "JPEG decode failed");
-                    esp_camera_fb_return(frameBuffer);
-                    continue;
-                }
-                tflitePreEditingBuffer = rawImageBuffer;
-            } else if (frameBuffer->format == PIXFORMAT_GRAYSCALE) {
-                tflitePreEditingBuffer = frameBuffer->buf;
-            } else {
-                ESP_LOGW(CAPTURE_TAG, "Unsupported pixel format %d", frameBuffer->format);
-                esp_camera_fb_return(frameBuffer);
-                vTaskDelay(pdMS_TO_TICKS(100));
-                continue;
-            }
-            jpegTimer.logCheckpoint(JPEG_TAG, "raw to jpeg conversion done");
-        #endif
-        // ---
 
-        // --- TensorFlow Lite inference ---
-        ESP_LOGD(CAPTURE_TAG, "TensorFlow Lite inference"); 
-        tensorFlowTimer.checkpoint();
-        if (frameBuffer->width >= TF_IMAGE_INPUT_SIZE && frameBuffer->height >= TF_IMAGE_INPUT_SIZE) {
-            int channels = (frameBuffer->format == PIXFORMAT_RGB565 || frameBuffer->format == PIXFORMAT_RGB888) ? 3 : 1;
-                
-            if (channels == 3) { // Convert to grayscale if needed
-                if (frameBuffer->format == PIXFORMAT_RGB565){
-                    convertRgb565ToGrayscale((uint16_t*)tflitePreEditingBuffer, processedFrame, frameBuffer->width, frameBuffer->height);
-                } else if (frameBuffer->format == PIXFORMAT_RGB888){
-                    convertRgb888ToGrayscale(tflitePreEditingBuffer, processedFrame, frameBuffer->width, frameBuffer->height);
-                } else {
-                    ESP_LOGW(CAPTURE_TAG, "Unsupported JPEG FORMAT) %d for RGB to grayscale conversion", frameBuffer->format);
-                }
-                // Crop and resize to 96x96
-                cropCenter(processedFrame, frameBuffer->width, frameBuffer->height, tfliteGray96x96InputBuffer, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE, 1);
-                
-            } else {
-                // Crop and resize to 96x96
-                cropCenter(tflitePreEditingBuffer, frameBuffer->width, frameBuffer->height, processedFrame, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE, 1);
+        const int64_t captureUs = esp_timer_get_time();
 
-                memcpy(tfliteGray96x96InputBuffer, processedFrame, TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE);
-            }
-
-            // Publish latest frame buffer for network transport.
-            const uint8_t *publishSrc = nullptr;
-            size_t publishLen = 0;
-            uint16_t publishWidth = TF_IMAGE_INPUT_SIZE;
-            uint16_t publishHeight = TF_IMAGE_INPUT_SIZE;
-            pixformat_t publishFormat = PIXFORMAT_GRAYSCALE;
-
-            if (frameBuffer->format == PIXFORMAT_JPEG) {
-                publishSrc = frameBuffer->buf;
-                publishLen = frameBuffer->len;
-                publishWidth = frameBuffer->width;
-                publishHeight = frameBuffer->height;
-                publishFormat = PIXFORMAT_JPEG;
-            } else {
-                //#if ENABLE_INFERENCE
-                    #if STREAM_ORIGINALLY_ACQUIRED_IMAGE
-                    if (frameBuffer->format == PIXFORMAT_GRAYSCALE) {
-                        publishSrc = tflitePreEditingBuffer;
-                        publishLen = (size_t)frameBuffer->width * (size_t)frameBuffer->height;
-                        publishWidth = frameBuffer->width;
-                        publishHeight = frameBuffer->height;
-                    } else {
-                        // Fallback to 96x96 stream for non-grayscale capture modes.
-                        publishSrc = tfliteGray96x96InputBuffer;
-                        publishLen = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE;
-                    }
-                    #else
-                        publishSrc = tfliteGray96x96InputBuffer;
-                        publishLen = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE;
-                    #endif
-                //#endif
-            }
-
-            if (publishLen > frameBufferSize) {
-                ESP_LOGW(CAPTURE_TAG,
-                         "Publish frame too large (%u > %u), truncating",
-                         (unsigned int)publishLen,
-                         (unsigned int)frameBufferSize);
-                publishLen = frameBufferSize;
-            }
-
-            uint8_t publishIndex = activeHttpFrameIndex ^ 1;
-            if (httpFrameBuffers[publishIndex] && publishSrc && publishLen > 0) {
-                memcpy(httpFrameBuffers[publishIndex], publishSrc, publishLen);
-                const int64_t nowUs = esp_timer_get_time();
-                taskENTER_CRITICAL(&httpFrameMetaLock);
-                activeHttpFrameLen = publishLen;
-                activeHttpFrameWidth = publishWidth;
-                activeHttpFrameHeight = publishHeight;
-                activeHttpFrameFormat = publishFormat;
-                activeHttpFrameIndex = publishIndex;
-                activeHttpFrameSeq++;
-                activeHttpFramePublishUs = nowUs;
-                taskEXIT_CRITICAL(&httpFrameMetaLock);
-
-                producedFrames++;
-                const int64_t elapsedUs = nowUs - producerWindowStartUs;
-                if (elapsedUs >= 2000000) {
-                    const float producerFps = (producedFrames * 1000000.0f) / (float)elapsedUs;
-                    ESP_LOGI(CAPTURE_TAG, "Producer FPS: %.2f | latest seq=%lu | frame=%dx%d fmt=%d len=%d",
-                             producerFps,
-                             (unsigned long)activeHttpFrameSeq,
+        #if ENABLE_RGB_STREAM_TASK
+            publishToMailbox(&streamMailbox,
+                             frameBuffer->buf,
+                             frameBuffer->len,
                              frameBuffer->width,
                              frameBuffer->height,
                              frameBuffer->format,
-                             frameBuffer->len);
-                    producedFrames = 0;
-                    producerWindowStartUs = nowUs;
-                }
+                             captureUs);
+        #endif
 
-                #if STOP_ACQUISITION_AFTER_1_FRAME
-                    if (activeHttpFrameSeq == 1) {
-                        pauseCameraAcquisition = true;
-                        ESP_LOGW(CAPTURE_TAG, "STOP_ACQUISITION_AFTER_1_FRAME active: acquisition paused after first frame");
-                    }
-                #endif
-            }
+        #if ENABLE_INFERENCE
+            publishToMailbox(&inferenceMailbox,
+                             frameBuffer->buf,
+                             frameBuffer->len,
+                             frameBuffer->width,
+                             frameBuffer->height,
+                             frameBuffer->format,
+                             captureUs);
+        #endif
 
-            // Run inference
-            #if ENABLE_INFERENCE
-                TfLiteTensor* input = tf_wrapper.getInputTensor();
-                if (input && input->dims && input->dims->size >= 4) {
-                    logFirstPixels(TF_TAG, "tfliteGray96x96InputBuffer", tfliteGray96x96InputBuffer, 10);
-                    bool person_present = tf_wrapper.runInference(tfliteGray96x96InputBuffer, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE);
-                    ESP_LOGW(TF_TAG, "Person detected? %s", person_present ? "YES" : "NO");
-                    if (person_present) {
-                        redLed.setLedGpio2(0);
-                        rgb.turnBlueLedOn(); // blue
-                    } else {
-                        redLed.setLedGpio2(1);
-                        rgb.turnRedLedOn(); // red
-                    }
-                } else {
-                    ESP_LOGE(TF_TAG, "Input tensor is null or malformed");
-                }
-            #endif
-        } else {
-            ESP_LOGW(CAPTURE_TAG, "Frame too small to resize to 96x96");
+        capturedFrames++;
+        const int64_t elapsedUs = captureUs - captureWindowStartUs;
+        if (elapsedUs >= 2000000) {
+            const float captureFps = (capturedFrames * 1000000.0f) / (float)elapsedUs;
+            ESP_LOGI(CAPTURE_TAG,
+                     "Capture FPS: %.2f | latest frame=%dx%d fmt=%d len=%d",
+                     captureFps,
+                     frameBuffer->width,
+                     frameBuffer->height,
+                     frameBuffer->format,
+                     frameBuffer->len);
+            capturedFrames = 0;
+            captureWindowStartUs = captureUs;
         }
-        tensorFlowTimer.logCheckpoint(TF_TAG, "tf inference done");
-        // ---
 
         esp_camera_fb_return(frameBuffer);
 
@@ -267,6 +411,158 @@ void capture_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
+
+void stream_publish_task(void *arg)
+{
+    ESP_LOGI("HTTP_STREAM", "Stream publish task started");
+
+    uint8_t* grayscaleWorkspace = (uint8_t*)heap_caps_malloc(kAcquiredFrameMaxPixels, MALLOC_CAP_8BIT);
+    uint8_t* gray96Buffer = (uint8_t*)heap_caps_malloc(TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE, MALLOC_CAP_8BIT);
+    if (!grayscaleWorkspace || !gray96Buffer) {
+        ESP_LOGE("HTTP_STREAM", "Failed to allocate stream publish workspace");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    uint32_t lastSeenSeq = 0;
+    uint32_t publishedFrames = 0;
+    int64_t publishWindowStartUs = esp_timer_get_time();
+
+    while (true) {
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
+
+        FrameSnapshot snapshot = {};
+        if (!snapshotMailbox(&streamMailbox, &snapshot) || snapshot.seq == lastSeenSeq) {
+            continue;
+        }
+
+        const uint8_t* publishSrc = nullptr;
+        size_t publishLen = 0;
+        uint16_t publishWidth = snapshot.width;
+        uint16_t publishHeight = snapshot.height;
+        pixformat_t publishFormat = snapshot.format;
+
+        if (snapshot.format == PIXFORMAT_JPEG) {
+            publishSrc = snapshot.data;
+            publishLen = snapshot.len;
+        } else {
+            #if STREAM_ORIGINALLY_ACQUIRED_IMAGE
+                if (snapshot.format == PIXFORMAT_GRAYSCALE) {
+                    publishSrc = snapshot.data;
+                    publishLen = (size_t)snapshot.width * (size_t)snapshot.height;
+                } else if (buildGray96Frame(snapshot,
+                                            grayscaleWorkspace,
+                                            kAcquiredFrameMaxPixels,
+                                            gray96Buffer)) {
+                    publishSrc = gray96Buffer;
+                    publishLen = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE;
+                    publishWidth = TF_IMAGE_INPUT_SIZE;
+                    publishHeight = TF_IMAGE_INPUT_SIZE;
+                    publishFormat = PIXFORMAT_GRAYSCALE;
+                }
+            #else
+                if (buildGray96Frame(snapshot,
+                                     grayscaleWorkspace,
+                                     kAcquiredFrameMaxPixels,
+                                     gray96Buffer)) {
+                    publishSrc = gray96Buffer;
+                    publishLen = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE;
+                    publishWidth = TF_IMAGE_INPUT_SIZE;
+                    publishHeight = TF_IMAGE_INPUT_SIZE;
+                    publishFormat = PIXFORMAT_GRAYSCALE;
+                }
+            #endif
+        }
+
+        if (!publishSrc || publishLen == 0) {
+            lastSeenSeq = snapshot.seq;
+            continue;
+        }
+
+        const int64_t publishUs = esp_timer_get_time();
+        publishHttpFrame(publishSrc,
+                         publishLen,
+                         publishWidth,
+                         publishHeight,
+                         publishFormat,
+                         publishUs);
+
+        lastSeenSeq = snapshot.seq;
+        publishedFrames++;
+
+        const int64_t elapsedUs = publishUs - publishWindowStartUs;
+        if (elapsedUs >= 2000000) {
+            const float publishFps = (publishedFrames * 1000000.0f) / (float)elapsedUs;
+            ESP_LOGI("HTTP_STREAM",
+                     "Publish FPS: %.2f | seq=%lu | frame=%dx%d fmt=%d len=%d",
+                     publishFps,
+                     (unsigned long)activeHttpFrameSeq,
+                     publishWidth,
+                     publishHeight,
+                     publishFormat,
+                     (unsigned int)publishLen);
+            publishedFrames = 0;
+            publishWindowStartUs = publishUs;
+        }
+    }
+}
+
+#if ENABLE_INFERENCE
+void inference_task(void *arg)
+{
+    ESP_LOGI(TF_TAG, "Inference task started");
+
+    uint8_t* grayscaleWorkspace = (uint8_t*)heap_caps_malloc(kAcquiredFrameMaxPixels, MALLOC_CAP_8BIT);
+    uint8_t* gray96Buffer = (uint8_t*)heap_caps_malloc(TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE, MALLOC_CAP_8BIT);
+    if (!grayscaleWorkspace || !gray96Buffer) {
+        ESP_LOGE(TF_TAG, "Failed to allocate inference workspace");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    uint32_t lastSeenSeq = 0;
+
+    while (true) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        FrameSnapshot snapshot = {};
+        if (!snapshotMailbox(&inferenceMailbox, &snapshot) || snapshot.seq == lastSeenSeq) {
+            continue;
+        }
+
+        tensorFlowTimer.checkpoint();
+        jpegTimer.checkpoint();
+        const bool prepared = buildGray96Frame(snapshot,
+                                               grayscaleWorkspace,
+                                               kAcquiredFrameMaxPixels,
+                                               gray96Buffer);
+        jpegTimer.logCheckpoint(JPEG_TAG, "inference input prepared");
+        if (!prepared) {
+            lastSeenSeq = snapshot.seq;
+            continue;
+        }
+
+        TfLiteTensor* input = tf_wrapper.getInputTensor();
+        if (input && input->dims && input->dims->size >= 4) {
+            logFirstPixels(TF_TAG, "gray96Buffer", gray96Buffer, 10);
+            bool person_present = tf_wrapper.runInference(gray96Buffer, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE);
+            ESP_LOGW(TF_TAG, "Person detected? %s", person_present ? "YES" : "NO");
+            if (person_present) {
+                redLed.setLedGpio2(0);
+                rgb.turnBlueLedOn();
+            } else {
+                redLed.setLedGpio2(1);
+                rgb.turnRedLedOn();
+            }
+        } else {
+            ESP_LOGE(TF_TAG, "Input tensor is null or malformed");
+        }
+
+        tensorFlowTimer.logCheckpoint(TF_TAG, "tf inference done");
+        lastSeenSeq = snapshot.seq;
+    }
+}
+#endif
 
 // HTTP handler — returns the latest captured frame payload
 esp_err_t captureRgbCallback(httpd_req_t *req)
@@ -898,6 +1194,22 @@ extern "C" void app_main(void)
         ESP_LOGW(OV2640_TAG, "Failed to get camera sensor handle for flipping");
     }
 
+    if (!initPublishedHttpFrameStore()) {
+        return;
+    }
+
+    #if ENABLE_RGB_STREAM_TASK
+        if (!initFrameMailbox(&streamMailbox, "stream")) {
+            return;
+        }
+    #endif
+
+    #if ENABLE_INFERENCE
+        if (!initFrameMailbox(&inferenceMailbox, "inference")) {
+            return;
+        }
+    #endif
+
     // HTTP server task (always on; transport-specific handlers are configured below).
     auto http_server_task = [](void* arg) {
         #if USE_TCP
@@ -940,15 +1252,49 @@ extern "C" void app_main(void)
         );
     #endif
 
+    #if ENABLE_RGB_STREAM_TASK
+        xTaskCreatePinnedToCore(
+            stream_publish_task,
+            "stream_publish_task",
+            6144,
+            NULL,
+            5,
+            &streamMailbox.consumerTaskHandle,
+            tskNO_AFFINITY
+        );
+        ESP_LOGI(OV2640_TAG, "Started stream publish task");
+    #else
+        ESP_LOGW(OV2640_TAG, "RGB stream publish task disabled");
+    #endif
+
+    #if ENABLE_INFERENCE
+        xTaskCreatePinnedToCore(
+            inference_task,
+            "inference_task",
+            6144,
+            NULL,
+            5,
+            &inferenceMailbox.consumerTaskHandle,
+            tskNO_AFFINITY
+        );
+        ESP_LOGI(OV2640_TAG, "Started inference task");
+    #else
+        ESP_LOGW(TF_TAG, "Inference task disabled for this build");
+    #endif
+
     // --- Start capture task ---
-    xTaskCreatePinnedToCore(capture_task, 
-                            "capture_task", 
-                            4096, 
-                            NULL, 
-                            5, 
-                            NULL, 
-                            1); //xCoreID 0 for main core, 1 for app core
-    ESP_LOGI(OV2640_TAG, "Started periodic capture task");
+    #if ENABLE_CAMERA_ACQUISITION_TASK
+        xTaskCreatePinnedToCore(capture_task,
+                                "capture_task",
+                                4096,
+                                NULL,
+                                5,
+                                NULL,
+                                1); //xCoreID 0 for main core, 1 for app core
+        ESP_LOGI(OV2640_TAG, "Started camera acquisition task");
+    #else
+        ESP_LOGW(OV2640_TAG, "Camera acquisition task disabled");
+    #endif
 
     // --- Optional: run for a limited time, then reboot ---
     /*char buffer[1024]; 
