@@ -19,6 +19,9 @@ public:
     void setCaptureHandler(CaptureCallback callback);
     void setStreamHandler(StreamCallback callback);
 
+    void http_stream_publish_task(void *arg);
+    void udp_stream_task(void *arg);
+
 private:
     static esp_err_t handleCapture(httpd_req_t *req);
     static esp_err_t handleIndex(httpd_req_t *req);

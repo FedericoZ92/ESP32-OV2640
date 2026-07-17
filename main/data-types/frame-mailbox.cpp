@@ -6,19 +6,29 @@
 #include <esp_heap_caps.h>
 #include <cstring>
 
-bool FrameMailboxManager::initFrameMailbox(const char* tag, size_t kPublishedFrameMaxBytes, uint32_t caps) //caps MALLOC_CAP_SPIRAM
+FrameMailboxManager::FrameMailboxManager(FrameMailbox* mailbox, size_t publishedFrameMaxBytes)
+    : mailbox(mailbox), publishedFrameMaxBytes_(publishedFrameMaxBytes) {}
+
+bool FrameMailboxManager::initFrameMailbox(const char* tag, uint32_t caps) //caps MALLOC_CAP_SPIRAM
 {
     if (!mailbox) {
         return false;
     }
     mailbox->tag = tag;
-    mailbox->buffers[0] = (uint8_t*)heap_caps_malloc(kPublishedFrameMaxBytes, caps);
-    mailbox->buffers[1] = (uint8_t*)heap_caps_malloc(kPublishedFrameMaxBytes, caps);
+    if (mailbox->buffers[0]){
+        delete[] mailbox->buffers[0];
+        mailbox->buffers[0] = nullptr;
+    }
+    if (mailbox->buffers[1]){
+        delete[] mailbox->buffers[1];
+        mailbox->buffers[1] = nullptr;
+    }
+    mailbox->buffers[0] = (uint8_t*)heap_caps_malloc(publishedFrameMaxBytes_, caps);
+    mailbox->buffers[1] = (uint8_t*)heap_caps_malloc(publishedFrameMaxBytes_, caps);
     if (!mailbox->buffers[0] || !mailbox->buffers[1]) {
         ESP_LOGE(MAIN_TAG, "Failed to allocate mailbox buffers for %s", tag ? tag : "unknown");
         return false;
     }
-
     mailbox->activeIndex = 0;
     mailbox->frameLen = 0;
     mailbox->frameWidth = 0;
@@ -30,8 +40,7 @@ bool FrameMailboxManager::initFrameMailbox(const char* tag, size_t kPublishedFra
     return true;
 }
 
-void FrameMailboxManager::publish( size_t kPublishedFrameMaxBytes,
-                                    const uint8_t* src,
+void FrameMailboxManager::publish(const uint8_t* src,
                                     size_t srcLen,
                                     uint16_t width,
                                     uint16_t height,
@@ -43,13 +52,13 @@ void FrameMailboxManager::publish( size_t kPublishedFrameMaxBytes,
     }
 
     size_t frameLen = srcLen;
-    if (frameLen > kPublishedFrameMaxBytes) {
+    if (frameLen > publishedFrameMaxBytes_) {
         ESP_LOGW(MAIN_TAG,
                  "Mailbox %s frame too large (%u > %u), truncating",
                  mailbox->tag ? mailbox->tag : "unknown",
                  (unsigned int)frameLen,
-                 (unsigned int)kPublishedFrameMaxBytes);
-        frameLen = kPublishedFrameMaxBytes;
+                 (unsigned int)publishedFrameMaxBytes_);
+        frameLen = publishedFrameMaxBytes_;
     }
 
     uint8_t publishIndex = mailbox->activeIndex ^ 1;

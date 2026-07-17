@@ -25,11 +25,10 @@ struct FrameMailbox {
 class FrameMailboxManager 
 {
 public:
-    FrameMailboxManager(FrameMailbox* mailbox) : mailbox(mailbox) {}
+    FrameMailboxManager(FrameMailbox* mailbox, size_t publishedFrameMaxBytes);
     ~FrameMailboxManager() = default;
-    bool initFrameMailbox(const char* tag, size_t kPublishedFrameMaxBytes, uint32_t caps);
-    void publish(   size_t kPublishedFrameMaxBytes,
-                    const uint8_t* src,
+    bool initFrameMailbox(const char* tag, uint32_t caps);
+    void publish( const uint8_t* src,
                     size_t srcLen,
                     uint16_t width,
                     uint16_t height,
@@ -39,9 +38,8 @@ public:
 
 private:
     FrameMailbox* mailbox;
+    size_t publishedFrameMaxBytes_ = 0;
 };
-
-
 
 extern FrameMailbox inferenceMailbox;
 extern FrameMailbox streamMailbox;

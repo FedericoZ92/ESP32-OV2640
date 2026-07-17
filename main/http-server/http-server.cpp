@@ -1,6 +1,12 @@
 #include "http-server/http-server.h"
 #include "define.h"
 #include "app-globals.h"
+#include "data-types/frame-mailbox.h"
+#include "data-types/frame-snapshot.h"
+#include <netinet/in.h>  // For ntohs, htons, sockaddr_in
+#include <arpa/inet.h>   // For inet_ntoa, inet_aton
+#include "image-editing/editing.h"
+#include "http-server/udp-fram-header.h"
 
 CameraHttpServer::CaptureCallback CameraHttpServer::s_captureCallback = nullptr;
 CameraHttpServer::StreamCallback CameraHttpServer::s_streamCallback = nullptr;
@@ -8,9 +14,7 @@ CameraHttpServer::StreamCallback CameraHttpServer::s_streamCallback = nullptr;
 CameraHttpServer::CameraHttpServer() = default;
 CameraHttpServer::~CameraHttpServer() { stop(); }
 
-// ============================
 // HTML page for live view using <canvas>
-// ============================
 #if USE_UDP
 static const char *INDEX_HTML = R"rawliteral(
 <!DOCTYPE html>
@@ -226,9 +230,7 @@ static const char *INDEX_HTML = R"rawliteral(
 )rawliteral";
 #endif
 
-// ============================
-// Start HTTP Server
-// ============================
+// start HTTP Server
 esp_err_t CameraHttpServer::start(uint16_t port)
 {
     if (serverHandle) {
@@ -319,9 +321,7 @@ esp_err_t CameraHttpServer::start(uint16_t port)
     return ESP_OK;
 }
 
-// ============================
-// Stop server
-// ============================
+// stop server
 void CameraHttpServer::stop()
 {
     if (serverHandle) {
@@ -331,9 +331,7 @@ void CameraHttpServer::stop()
     }
 }
 
-// ============================
-// Set capture handler
-// ============================
+// set capture handler
 void CameraHttpServer::setCaptureHandler(CaptureCallback callback)
 {
     s_captureCallback = callback;
@@ -344,9 +342,8 @@ void CameraHttpServer::setStreamHandler(StreamCallback callback)
   s_streamCallback = callback;
 }
 
-// ============================
-// Generic capture handler
-// ============================
+
+// generic capture handler
 esp_err_t CameraHttpServer::handleCapture(httpd_req_t *req)
 {
     if (s_captureCallback) {
@@ -357,5 +354,268 @@ esp_err_t CameraHttpServer::handleCapture(httpd_req_t *req)
     } else {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No capture handler");
         return ESP_FAIL;
+    }
+}
+
+#pragma region HTTP_STREAM_TASK
+void CameraHttpServer::http_stream_publish_task(void *arg)
+{
+    ESP_LOGI("HTTP_STREAM", "Stream publish task started");
+
+    uint8_t* grayscaleWorkspace = (uint8_t*)heap_caps_malloc(kAcquiredFrameMaxPixels, MALLOC_CAP_8BIT);
+    uint8_t* gray96Buffer = (uint8_t*)heap_caps_malloc(TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE, MALLOC_CAP_8BIT);
+    if (!grayscaleWorkspace || !gray96Buffer) {
+        ESP_LOGE("HTTP_STREAM", "Failed to allocate stream publish workspace");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    uint32_t lastSeenSeq = 0;
+    uint32_t publishedFrames = 0;
+    int64_t publishWindowStartUs = esp_timer_get_time();
+
+    while (true) {
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
+
+        FrameSnapshot snapshot = {};
+        bool snapshotResult = streamMailboxManager.snapshot(&snapshot);
+        if (!snapshotResult || snapshot.seq == lastSeenSeq) {
+            continue;
+        }
+
+        const uint8_t* publishSrc = nullptr;
+        size_t publishLen = 0;
+        uint16_t publishWidth = snapshot.width;
+        uint16_t publishHeight = snapshot.height;
+        pixformat_t publishFormat = snapshot.format;
+
+        if (snapshot.format == PIXFORMAT_JPEG) {
+            publishSrc = snapshot.data;
+            publishLen = snapshot.len;
+        } else {
+            #if STREAM_ORIGINALLY_ACQUIRED_IMAGE
+                if (snapshot.format == PIXFORMAT_GRAYSCALE) {
+                    publishSrc = snapshot.data;
+                    publishLen = (size_t)snapshot.width * (size_t)snapshot.height;
+                } else if (buildGray96Frame(snapshot,
+                                            grayscaleWorkspace,
+                                            kAcquiredFrameMaxPixels,
+                                            gray96Buffer,
+                                            TF_IMAGE_INPUT_SIZE)) {
+                    publishSrc = gray96Buffer;
+                    publishLen = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE;
+                    publishWidth = TF_IMAGE_INPUT_SIZE;
+                    publishHeight = TF_IMAGE_INPUT_SIZE;
+                    publishFormat = PIXFORMAT_GRAYSCALE;
+                }
+            #else
+                if (buildGray96Frame(snapshot,
+                                     grayscaleWorkspace,
+                                     kAcquiredFrameMaxPixels,
+                                     kAcquiredFrameMaxPixels,
+                                     gray96Buffer,
+                                     TF_IMAGE_INPUT_SIZE)) {
+                    publishLen = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE;
+                    publishWidth = TF_IMAGE_INPUT_SIZE;
+                    publishHeight = TF_IMAGE_INPUT_SIZE;
+                    publishFormat = PIXFORMAT_GRAYSCALE;
+                }
+            #endif
+        }
+
+        if (!publishSrc || publishLen == 0) {
+            lastSeenSeq = snapshot.seq;
+            continue;
+        }
+
+        const int64_t publishUs = esp_timer_get_time();
+        httpFrameBuffer.publishHttpFrame(publishSrc,
+                                        publishLen,
+                                        publishWidth,
+                                        publishHeight,
+                                        publishFormat,
+                                        publishUs);
+
+        lastSeenSeq = snapshot.seq;
+        publishedFrames++;
+
+        const int64_t elapsedUs = publishUs - publishWindowStartUs;
+        if (elapsedUs >= 2000000) {
+            const float publishFps = (publishedFrames * 1000000.0f) / (float)elapsedUs;
+            ESP_LOGI("HTTP_STREAM",
+                     "Publish FPS: %.2f | seq=%lu | frame=%dx%d fmt=%d len=%d",
+                     publishFps,
+                     (unsigned long)httpFrameBuffer.getActiveHttpFrameSeq(),
+                     publishWidth,
+                     publishHeight,
+                     publishFormat,
+                     (unsigned int)publishLen);
+            publishedFrames = 0;
+            publishWindowStartUs = publishUs;
+        }
+    }
+}
+
+#pragma region UDP_STREAM_TASK
+void CameraHttpServer::udp_stream_task(void *arg)
+{
+    const uint32_t kMagic = 0x47504455U; // 'UDPG'
+    const int kMaxPayload = UDP_STREAM_MAX_PAYLOAD;
+    const int kPort = UDP_STREAM_PORT;
+
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (sock < 0) {
+        ESP_LOGE("UDP_STREAM", "Failed to create UDP socket");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    struct sockaddr_in localAddr = {};
+    localAddr.sin_family = AF_INET;
+    localAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    localAddr.sin_port = htons((uint16_t)kPort);
+
+    if (bind(sock, (struct sockaddr *)&localAddr, sizeof(localAddr)) != 0) {
+        ESP_LOGE("UDP_STREAM", "Failed to bind UDP socket on port %d", kPort);
+        close(sock);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    struct timeval recvTimeout = {};
+    recvTimeout.tv_sec = 0;
+    recvTimeout.tv_usec = 200000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &recvTimeout, sizeof(recvTimeout));
+
+    ESP_LOGI("UDP_STREAM", "UDP stream waiting for client hello on port %d", kPort);
+
+    bool hasClient = false;
+    struct sockaddr_in clientAddr = {};
+    socklen_t clientAddrLen = sizeof(clientAddr);
+
+    uint8_t *frameSnapshot = (uint8_t *)heap_caps_malloc(kPublishedFrameMaxBytes, MALLOC_CAP_8BIT);
+    if (!frameSnapshot) {
+        ESP_LOGE("UDP_STREAM", "Failed to allocate frame snapshot buffer");
+        close(sock);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    uint8_t packet[sizeof(UdpFrameHeader) + UDP_STREAM_MAX_PAYLOAD];
+    uint32_t lastSentSeq = 0;
+    uint32_t txFrames = 0;
+    uint32_t txChunks = 0;
+    uint32_t txErrors = 0;
+    int64_t txWindowStartUs = esp_timer_get_time();
+
+    while (true) {
+        char helloBuf[64];
+        struct sockaddr_in rxAddr = {};
+        socklen_t rxLen = sizeof(rxAddr);
+        int rx = recvfrom(sock, helloBuf, sizeof(helloBuf) - 1, 0, (struct sockaddr *)&rxAddr, &rxLen);
+        if (rx > 0) {
+            helloBuf[rx] = '\0';
+            clientAddr = rxAddr;
+            clientAddrLen = rxLen;
+            hasClient = true;
+            ESP_LOGI("UDP_STREAM", "Client registered: %s:%u (%s)",
+                     inet_ntoa(clientAddr.sin_addr),
+                     ntohs(clientAddr.sin_port),
+                     helloBuf);
+        }
+
+        if (!hasClient) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+
+        size_t frameLen = 0;
+        uint8_t frameIndex = 0;
+        uint32_t frameSeq = 0;
+        int64_t framePublishUs = 0;
+        taskENTER_CRITICAL(&httpFrameMetaLock);
+        frameLen = activeHttpFrameLen;
+        frameIndex = activeHttpFrameIndex;
+        frameSeq = activeHttpFrameSeq;
+        framePublishUs = activeHttpFramePublishUs;
+        taskEXIT_CRITICAL(&httpFrameMetaLock);
+
+        if (frameLen == 0 || !httpFrameBuffers[frameIndex]) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        if (frameLen > kPublishedFrameMaxBytes) {
+            frameLen = kPublishedFrameMaxBytes;
+        }
+
+        if (frameSeq == lastSentSeq) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+
+        memcpy(frameSnapshot, httpFrameBuffers[frameIndex], frameLen);
+
+        const uint16_t chunkCount = (uint16_t)((frameLen + kMaxPayload - 1) / kMaxPayload);
+        const int64_t nowUs = esp_timer_get_time();
+        const uint32_t frameAgeMs = (framePublishUs > 0 && nowUs > framePublishUs)
+            ? (uint32_t)((nowUs - framePublishUs) / 1000)
+            : 0;
+
+        bool frameFailed = false;
+        for (uint16_t chunkIndex = 0; chunkIndex < chunkCount; chunkIndex++) {
+            const size_t offset = chunkIndex * kMaxPayload;
+            const size_t remaining = frameLen - offset;
+            const uint16_t payloadLen = (uint16_t)((remaining > (size_t)kMaxPayload) ? kMaxPayload : remaining);
+
+            UdpFrameHeader header = {};
+            header.magic = htonl(kMagic);
+            header.frameSeq = htonl(frameSeq);
+            header.chunkIndex = htons(chunkIndex);
+            header.chunkCount = htons(chunkCount);
+            header.payloadLen = htons(payloadLen);
+            header.frameLen = htons((uint16_t)frameLen);
+            header.frameAgeMs = htonl(frameAgeMs);
+
+            memcpy(packet, &header, sizeof(header));
+            memcpy(packet + sizeof(header), frameSnapshot + offset, payloadLen);
+
+            int sent = sendto(sock,
+                              packet,
+                              sizeof(header) + payloadLen,
+                              0,
+                              (struct sockaddr *)&clientAddr,
+                              clientAddrLen);
+            if (sent < 0) {
+                txErrors++;
+                frameFailed = true;
+                break;
+            }
+            txChunks++;
+        }
+
+        if (!frameFailed) {
+            lastSentSeq = frameSeq;
+            txFrames++;
+        }
+
+        const int64_t elapsedUs = nowUs - txWindowStartUs;
+        if (elapsedUs >= 2000000) {
+            const float fps = (txFrames * 1000000.0f) / (float)elapsedUs;
+            ESP_LOGI("UDP_STREAM",
+                     "tx_fps=%.2f | frames=%lu | chunks=%lu | err=%lu | last_seq=%lu | frame_len=%u",
+                     fps,
+                     (unsigned long)txFrames,
+                     (unsigned long)txChunks,
+                     (unsigned long)txErrors,
+                     (unsigned long)lastSentSeq,
+                     (unsigned int)frameLen);
+            txWindowStartUs = nowUs;
+            txFrames = 0;
+            txChunks = 0;
+            txErrors = 0;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 }

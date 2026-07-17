@@ -16,6 +16,7 @@
 #include "util/misc.h"
 #include "define.h"
 #include "data-types/frame-mailbox.h"
+#include "http-server/http-frame-buffer.h"
 #include <stdio.h>
 #include <cstring>
 #include <freertos/FreeRTOS.h>
@@ -39,11 +40,11 @@
 
 // camera parameters in camera-driver.cpp!
 
-CameraHttpServer server;
-WifiManager wifi;
+static CameraHttpServer server;
+static WifiManager wifi;
 RgbLedController rgb(GPIO_NUM_48, RMT_CHANNEL_0); // 8 LEDs on GPIO48
-    
 RedLedController redLed = RedLedController();
+static TfLiteWrapper tf_wrapper;
 
 CheckpointTimer jpegTimer;
 CheckpointTimer cameraAcquisitionTimer;
@@ -51,193 +52,28 @@ CheckpointTimer tensorFlowTimer;
 CheckpointTimer httpTimer;
 
 // --- Shared static frame buffer ---
-static uint8_t* httpFrameBuffers[2] = {nullptr, nullptr};
+/*static uint8_t* httpFrameBuffers[2] = {nullptr, nullptr};
 static volatile uint8_t activeHttpFrameIndex = 0;
 static volatile size_t activeHttpFrameLen = 0;
 static volatile uint16_t activeHttpFrameWidth = TF_IMAGE_INPUT_SIZE;
 static volatile uint16_t activeHttpFrameHeight = TF_IMAGE_INPUT_SIZE;
 static volatile pixformat_t activeHttpFrameFormat = PIXFORMAT_GRAYSCALE;
 static volatile uint32_t activeHttpFrameSeq = 0;
-static volatile int64_t activeHttpFramePublishUs = 0;
+static volatile int64_t activeHttpFramePublishUs = 0;*/
+HttpFrameBuffer httpFrameBuffer(kPublishedFrameMaxBytes);
 
 volatile bool pauseCameraAcquisition = false;
 
 static portMUX_TYPE httpFrameMetaLock = portMUX_INITIALIZER_UNLOCKED;
-static TfLiteWrapper tf_wrapper;
+
 
 FrameMailbox inferenceMailbox;
 FrameMailbox streamMailbox;
-FrameMailboxManager inferenceMailboxManager(&inferenceMailbox);
-FrameMailboxManager streamMailboxManager(&streamMailbox);
+FrameMailboxManager inferenceMailboxManager(&inferenceMailbox, kPublishedFrameMaxBytes);
+FrameMailboxManager streamMailboxManager(&streamMailbox, kPublishedFrameMaxBytes);
 
-
-
-static bool initPublishedHttpFrameStore()
-{
-    httpFrameBuffers[0] = (uint8_t*)heap_caps_malloc(kPublishedFrameMaxBytes, MALLOC_CAP_SPIRAM);
-    httpFrameBuffers[1] = (uint8_t*)heap_caps_malloc(kPublishedFrameMaxBytes, MALLOC_CAP_SPIRAM);
-    if (!httpFrameBuffers[0] || !httpFrameBuffers[1]) {
-        ESP_LOGE(MAIN_TAG, "Failed to allocate published HTTP frame buffers");
-        return false;
-    }
-
-    activeHttpFrameLen = 0;
-    activeHttpFrameWidth = TF_IMAGE_INPUT_SIZE;
-    activeHttpFrameHeight = TF_IMAGE_INPUT_SIZE;
-    activeHttpFrameFormat = PIXFORMAT_GRAYSCALE;
-    activeHttpFrameSeq = 0;
-    activeHttpFramePublishUs = 0;
-    return true;
-}
-
-static void publishHttpFrame(const uint8_t* src,
-                             size_t srcLen,
-                             uint16_t width,
-                             uint16_t height,
-                             pixformat_t format,
-                             int64_t publishUs)
-{
-    if (!src || srcLen == 0) {
-        return;
-    }
-
-    size_t frameLen = srcLen;
-    if (frameLen > kPublishedFrameMaxBytes) {
-        ESP_LOGW(HTTP_TAG,
-                 "Published frame too large (%u > %u), truncating",
-                 (unsigned int)frameLen,
-                 (unsigned int)kPublishedFrameMaxBytes);
-        frameLen = kPublishedFrameMaxBytes;
-    }
-
-    uint8_t publishIndex = activeHttpFrameIndex ^ 1;
-    if (!httpFrameBuffers[publishIndex]) {
-        return;
-    }
-
-    memcpy(httpFrameBuffers[publishIndex], src, frameLen);
-
-    taskENTER_CRITICAL(&httpFrameMetaLock);
-    activeHttpFrameLen = frameLen;
-    activeHttpFrameWidth = width;
-    activeHttpFrameHeight = height;
-    activeHttpFrameFormat = format;
-    activeHttpFrameIndex = publishIndex;
-    activeHttpFrameSeq++;
-    activeHttpFramePublishUs = publishUs;
-    taskEXIT_CRITICAL(&httpFrameMetaLock);
-
-    #if STOP_ACQUISITION_AFTER_1_FRAME
-        if (activeHttpFrameSeq == 1) {
-            pauseCameraAcquisition = true;
-            ESP_LOGW(CAPTURE_TAG, "STOP_ACQUISITION_AFTER_1_FRAME active: acquisition paused after first frame");
-        }
-    #endif
-}
-
-
-void stream_publish_task(void *arg)
-{
-    ESP_LOGI("HTTP_STREAM", "Stream publish task started");
-
-    uint8_t* grayscaleWorkspace = (uint8_t*)heap_caps_malloc(kAcquiredFrameMaxPixels, MALLOC_CAP_8BIT);
-    uint8_t* gray96Buffer = (uint8_t*)heap_caps_malloc(TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE, MALLOC_CAP_8BIT);
-    if (!grayscaleWorkspace || !gray96Buffer) {
-        ESP_LOGE("HTTP_STREAM", "Failed to allocate stream publish workspace");
-        vTaskDelete(NULL);
-        return;
-    }
-
-    uint32_t lastSeenSeq = 0;
-    uint32_t publishedFrames = 0;
-    int64_t publishWindowStartUs = esp_timer_get_time();
-
-    while (true) {
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
-
-        FrameSnapshot snapshot = {};
-        bool snapshotResult = streamMailboxManager.snapshot(&snapshot);
-        if (!snapshotResult || snapshot.seq == lastSeenSeq) {
-            continue;
-        }
-
-        const uint8_t* publishSrc = nullptr;
-        size_t publishLen = 0;
-        uint16_t publishWidth = snapshot.width;
-        uint16_t publishHeight = snapshot.height;
-        pixformat_t publishFormat = snapshot.format;
-
-        if (snapshot.format == PIXFORMAT_JPEG) {
-            publishSrc = snapshot.data;
-            publishLen = snapshot.len;
-        } else {
-            #if STREAM_ORIGINALLY_ACQUIRED_IMAGE
-                if (snapshot.format == PIXFORMAT_GRAYSCALE) {
-                    publishSrc = snapshot.data;
-                    publishLen = (size_t)snapshot.width * (size_t)snapshot.height;
-                } else if (buildGray96Frame(snapshot,
-                                            grayscaleWorkspace,
-                                            kAcquiredFrameMaxPixels,
-                                            gray96Buffer,
-                                            TF_IMAGE_INPUT_SIZE)) {
-                    publishSrc = gray96Buffer;
-                    publishLen = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE;
-                    publishWidth = TF_IMAGE_INPUT_SIZE;
-                    publishHeight = TF_IMAGE_INPUT_SIZE;
-                    publishFormat = PIXFORMAT_GRAYSCALE;
-                }
-            #else
-                if (buildGray96Frame(snapshot,
-                                     grayscaleWorkspace,
-                                     kAcquiredFrameMaxPixels,
-                                     kAcquiredFrameMaxPixels,
-                                     gray96Buffer,
-                                     TF_IMAGE_INPUT_SIZE)) {
-                    publishLen = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE;
-                    publishWidth = TF_IMAGE_INPUT_SIZE;
-                    publishHeight = TF_IMAGE_INPUT_SIZE;
-                    publishFormat = PIXFORMAT_GRAYSCALE;
-                }
-            #endif
-        }
-
-        if (!publishSrc || publishLen == 0) {
-            lastSeenSeq = snapshot.seq;
-            continue;
-        }
-
-        const int64_t publishUs = esp_timer_get_time();
-        publishHttpFrame(publishSrc,
-                         publishLen,
-                         publishWidth,
-                         publishHeight,
-                         publishFormat,
-                         publishUs);
-
-        lastSeenSeq = snapshot.seq;
-        publishedFrames++;
-
-        const int64_t elapsedUs = publishUs - publishWindowStartUs;
-        if (elapsedUs >= 2000000) {
-            const float publishFps = (publishedFrames * 1000000.0f) / (float)elapsedUs;
-            ESP_LOGI("HTTP_STREAM",
-                     "Publish FPS: %.2f | seq=%lu | frame=%dx%d fmt=%d len=%d",
-                     publishFps,
-                     (unsigned long)activeHttpFrameSeq,
-                     publishWidth,
-                     publishHeight,
-                     publishFormat,
-                     (unsigned int)publishLen);
-            publishedFrames = 0;
-            publishWindowStartUs = publishUs;
-        }
-    }
-}
-
-
-
-// HTTP handler — returns the latest captured frame payload
-esp_err_t captureRgbCallback(httpd_req_t *req)
+// HTTP handler, returns the latest captured frame payload, uses httpd_resp_send (HTTP over TCP)
+esp_err_t captureRgbTcpCallback(httpd_req_t *req)
 {
     const int64_t reqStartUs = esp_timer_get_time();
     static int64_t httpReqWindowStartUs = 0;
@@ -270,7 +106,7 @@ esp_err_t captureRgbCallback(httpd_req_t *req)
 
     httpd_resp_set_type(req, "application/octet-stream");
 
-    size_t frameLen = 0;
+    size_t frameLength = 0;
     uint8_t frameIndex = 0;
     uint16_t frameWidth = TF_IMAGE_INPUT_SIZE;
     uint16_t frameHeight = TF_IMAGE_INPUT_SIZE;
@@ -278,13 +114,13 @@ esp_err_t captureRgbCallback(httpd_req_t *req)
     uint32_t frameSeq = 0;
     int64_t framePublishUs = 0;
     taskENTER_CRITICAL(&httpFrameMetaLock);
-    frameLen = activeHttpFrameLen;
-    frameIndex = activeHttpFrameIndex;
-    frameWidth = activeHttpFrameWidth;
-    frameHeight = activeHttpFrameHeight;
-    frameFormat = activeHttpFrameFormat;
-    frameSeq = activeHttpFrameSeq;
-    framePublishUs = activeHttpFramePublishUs;
+    frameLength = httpFrameBuffer.getActiveHttpFrameLength();
+    frameIndex = httpFrameBuffer.getActiveHttpFrameIndex();
+    frameWidth = httpFrameBuffer.getActiveHttpFrameWidth();
+    frameHeight = httpFrameBuffer.getActiveHttpFrameHeight();
+    frameFormat = httpFrameBuffer.getActiveHttpFrameFormat();
+    frameSeq = httpFrameBuffer.getActiveHttpFrameSeq();
+    framePublishUs = httpFrameBuffer.getActiveHttpFramePublishUs();
     taskEXIT_CRITICAL(&httpFrameMetaLock);
 
     if (frameFormat == PIXFORMAT_JPEG) {
@@ -305,7 +141,7 @@ esp_err_t captureRgbCallback(httpd_req_t *req)
     httpd_resp_set_hdr(req, "X-Frame-Age-Ms", ageBuf);
 
     char lenBuf[16];
-    snprintf(lenBuf, sizeof(lenBuf), "%u", (unsigned int)frameLen);
+    snprintf(lenBuf, sizeof(lenBuf), "%u", (unsigned int)frameLength);
     httpd_resp_set_hdr(req, "X-Frame-Len", lenBuf);
 
     char widthBuf[8];
@@ -343,18 +179,18 @@ esp_err_t captureRgbCallback(httpd_req_t *req)
     httpReqWindowLastSeq = frameSeq;
 
     const uint8_t *sendPtr = nullptr;
-    size_t sendLen = frameLen;
-    if (frameLen > 0 && httpFrameBuffers[frameIndex]) {
-        sendPtr = httpFrameBuffers[frameIndex];
+    size_t sendLength = frameLength;
+    if (frameLength > 0 && httpFrameBuffer.isBuffersInitialized(frameIndex)) {
+        sendPtr = httpFrameBuffer.getBuffer(frameIndex);
     } else {
         // Send a blank frame until the first capture is published.
         static uint8_t blank[kPublishedFrameMaxBytes] = {0};
         sendPtr = blank;
-        sendLen = sizeof(blank);
+        sendLength = sizeof(blank);
     }
 
     const int64_t sendStartUs = esp_timer_get_time();
-    esp_err_t sendErr = httpd_resp_send(req, (const char*)sendPtr, sendLen);
+    esp_err_t sendErr = httpd_resp_send(req, (const char*)sendPtr, sendLength);
     const int64_t sendEndUs = esp_timer_get_time();
     const int64_t sendUs = (sendEndUs > sendStartUs) ? (sendEndUs - sendStartUs) : 0;
     const int64_t reqTotalUs = (sendEndUs > reqStartUs) ? (sendEndUs - reqStartUs) : 0;
@@ -396,7 +232,7 @@ esp_err_t captureRgbCallback(httpd_req_t *req)
                  avgReqMs,
                  (unsigned long)txWindowErrCount,
                  (unsigned long)txWindowCount,
-                 (unsigned int)sendLen,
+                 (unsigned int)sendLength,
                  (unsigned long)frameSeq);
         txWindowCount = 0;
         txWindowErrCount = 0;
@@ -426,7 +262,7 @@ esp_err_t captureRgbCallback(httpd_req_t *req)
                  droppedPerSec,
                  (unsigned long)frameSeq,
                  (long long)(ageUs / 1000),
-                 (unsigned int)sendLen,
+                 (unsigned int)sendLength,
                  avgAdvance,
                  (unsigned long)httpReqWindowMaxAdvance);
 
@@ -487,8 +323,8 @@ esp_err_t captureRgbCallback(httpd_req_t *req)
     return sendErr;
 }
 
-// HTTP handler — keeps one connection open and streams frames continuously.
-esp_err_t streamTcpRgbCallback(httpd_req_t *req)
+// HTTP handler, keeps one connection open and streams frames continuously, uses httpd_resp_send_chunk (HTTP multipart over TCP)
+esp_err_t streamRgbTcpCallback(httpd_req_t *req)
 {
     esp_err_t res = ESP_OK;
     char *part_buf = (char*)malloc(256);
@@ -502,16 +338,12 @@ esp_err_t streamTcpRgbCallback(httpd_req_t *req)
     // 1. Prepare initial Multipart headers
     res = httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=" STREAM_BOUNDARY);
     if (res != ESP_OK) { free(part_buf); return res; }
-
     res = httpd_resp_set_hdr(req, "Connection", "keep-alive");
     if (res != ESP_OK) { free(part_buf); return res; }
-
     res = httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
     if (res != ESP_OK) { free(part_buf); return res; }
-
     res = httpd_resp_set_hdr(req, "Pragma", "no-cache");
     if (res != ESP_OK) { free(part_buf); return res; }
-
     res = httpd_resp_set_hdr(req, "Expires", "0");
     if (res != ESP_OK) { free(part_buf); return res; }
 
@@ -527,7 +359,7 @@ esp_err_t streamTcpRgbCallback(httpd_req_t *req)
 
     // 3. Stream loop
     while (true) {
-        size_t frameLen = 0;
+        size_t frameLength = 0;
         uint8_t frameIndex = 0;
         uint16_t frameWidth = TF_IMAGE_INPUT_SIZE;
         uint16_t frameHeight = TF_IMAGE_INPUT_SIZE;
@@ -537,7 +369,7 @@ esp_err_t streamTcpRgbCallback(httpd_req_t *req)
 
         // Check if a new frame is ready
         taskENTER_CRITICAL(&httpFrameMetaLock);
-        frameSeq = activeHttpFrameSeq;
+        frameSeq = httpFrameBuffer.getActiveHttpFrameSeq();
         taskEXIT_CRITICAL(&httpFrameMetaLock);
 
         if (frameSeq == lastSeenSeq) {
@@ -548,17 +380,17 @@ esp_err_t streamTcpRgbCallback(httpd_req_t *req)
 
         // Extract metadata safely
         taskENTER_CRITICAL(&httpFrameMetaLock);
-        frameLen = activeHttpFrameLen;
-        frameIndex = activeHttpFrameIndex;
-        frameWidth = activeHttpFrameWidth;
-        frameHeight = activeHttpFrameHeight;
-        frameFormat = activeHttpFrameFormat;
-        framePublishUs = activeHttpFramePublishUs;
+        frameLength = httpFrameBuffer.getActiveHttpFrameLength();
+        frameIndex = httpFrameBuffer.getActiveHttpFrameIndex();
+        frameWidth = httpFrameBuffer.getActiveHttpFrameWidth();
+        frameHeight = httpFrameBuffer.getActiveHttpFrameHeight();
+        frameFormat = httpFrameBuffer.getActiveHttpFrameFormat();
+        framePublishUs = httpFrameBuffer.getActiveHttpFramePublishUs();
         taskEXIT_CRITICAL(&httpFrameMetaLock);
 
         // Read directly from the active buffer (safe due to double-buffering architecture)
-        const uint8_t *sendPtr = httpFrameBuffers[frameIndex];
-        if (!sendPtr || frameLen == 0) {
+        const uint8_t *sendPtr = httpFrameBuffer.getBuffer(frameIndex);
+        if (!sendPtr || frameLength == 0) {
             vTaskDelay(pdMS_TO_TICKS(5));
             continue;
         }
@@ -570,7 +402,7 @@ esp_err_t streamTcpRgbCallback(httpd_req_t *req)
         int hlen = snprintf(part_buf, 256,
             "--" STREAM_BOUNDARY "\r\n"
             "Content-Type: %s\r\n"
-            "Content-Length: %d\r\n"
+            "Content-Length: %zu\r\n"
             "X-Frame-Seq: %lu\r\n"
             "X-Frame-Age-Ms: %lld\r\n"
             "X-Frame-Width: %d\r\n"
@@ -578,7 +410,7 @@ esp_err_t streamTcpRgbCallback(httpd_req_t *req)
             "X-Frame-Format: %s\r\n"
             "\r\n",
             (frameFormat == PIXFORMAT_JPEG) ? "image/jpeg" : "application/octet-stream",
-            (int)frameLen,
+            (size_t)frameLength,
             (unsigned long)frameSeq,
             (long long)(ageUs / 1000),
             (int)frameWidth,
@@ -604,179 +436,6 @@ esp_err_t streamTcpRgbCallback(httpd_req_t *req)
     ESP_LOGI("HTTP_STREAM", "Multipart stream session ended: %s", esp_err_to_name(res));
     free(part_buf);
     return res;
-}
-
-typedef struct __attribute__((packed)) {
-    uint32_t magic;
-    uint32_t frameSeq;
-    uint16_t chunkIndex;
-    uint16_t chunkCount;
-    uint16_t payloadLen;
-    uint16_t frameLen;
-    uint32_t frameAgeMs;
-} UdpFrameHeader;
-
-void udp_stream_task(void *arg)
-{
-    const uint32_t kMagic = 0x47504455U; // 'UDPG'
-    const int kMaxPayload = UDP_STREAM_MAX_PAYLOAD;
-    const int kPort = UDP_STREAM_PORT;
-
-    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-    if (sock < 0) {
-        ESP_LOGE("UDP_STREAM", "Failed to create UDP socket");
-        vTaskDelete(NULL);
-        return;
-    }
-
-    struct sockaddr_in localAddr = {};
-    localAddr.sin_family = AF_INET;
-    localAddr.sin_addr.s_addr = htonl(INADDR_ANY);
-    localAddr.sin_port = htons((uint16_t)kPort);
-
-    if (bind(sock, (struct sockaddr *)&localAddr, sizeof(localAddr)) != 0) {
-        ESP_LOGE("UDP_STREAM", "Failed to bind UDP socket on port %d", kPort);
-        close(sock);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    struct timeval recvTimeout = {};
-    recvTimeout.tv_sec = 0;
-    recvTimeout.tv_usec = 200000;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &recvTimeout, sizeof(recvTimeout));
-
-    ESP_LOGI("UDP_STREAM", "UDP stream waiting for client hello on port %d", kPort);
-
-    bool hasClient = false;
-    struct sockaddr_in clientAddr = {};
-    socklen_t clientAddrLen = sizeof(clientAddr);
-
-    uint8_t *frameSnapshot = (uint8_t *)heap_caps_malloc(kPublishedFrameMaxBytes, MALLOC_CAP_8BIT);
-    if (!frameSnapshot) {
-        ESP_LOGE("UDP_STREAM", "Failed to allocate frame snapshot buffer");
-        close(sock);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    uint8_t packet[sizeof(UdpFrameHeader) + UDP_STREAM_MAX_PAYLOAD];
-    uint32_t lastSentSeq = 0;
-    uint32_t txFrames = 0;
-    uint32_t txChunks = 0;
-    uint32_t txErrors = 0;
-    int64_t txWindowStartUs = esp_timer_get_time();
-
-    while (true) {
-        char helloBuf[64];
-        struct sockaddr_in rxAddr = {};
-        socklen_t rxLen = sizeof(rxAddr);
-        int rx = recvfrom(sock, helloBuf, sizeof(helloBuf) - 1, 0, (struct sockaddr *)&rxAddr, &rxLen);
-        if (rx > 0) {
-            helloBuf[rx] = '\0';
-            clientAddr = rxAddr;
-            clientAddrLen = rxLen;
-            hasClient = true;
-            ESP_LOGI("UDP_STREAM", "Client registered: %s:%u (%s)",
-                     inet_ntoa(clientAddr.sin_addr),
-                     ntohs(clientAddr.sin_port),
-                     helloBuf);
-        }
-
-        if (!hasClient) {
-            vTaskDelay(pdMS_TO_TICKS(20));
-            continue;
-        }
-
-        size_t frameLen = 0;
-        uint8_t frameIndex = 0;
-        uint32_t frameSeq = 0;
-        int64_t framePublishUs = 0;
-        taskENTER_CRITICAL(&httpFrameMetaLock);
-        frameLen = activeHttpFrameLen;
-        frameIndex = activeHttpFrameIndex;
-        frameSeq = activeHttpFrameSeq;
-        framePublishUs = activeHttpFramePublishUs;
-        taskEXIT_CRITICAL(&httpFrameMetaLock);
-
-        if (frameLen == 0 || !httpFrameBuffers[frameIndex]) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
-
-        if (frameLen > kPublishedFrameMaxBytes) {
-            frameLen = kPublishedFrameMaxBytes;
-        }
-
-        if (frameSeq == lastSentSeq) {
-            vTaskDelay(pdMS_TO_TICKS(5));
-            continue;
-        }
-
-        memcpy(frameSnapshot, httpFrameBuffers[frameIndex], frameLen);
-
-        const uint16_t chunkCount = (uint16_t)((frameLen + kMaxPayload - 1) / kMaxPayload);
-        const int64_t nowUs = esp_timer_get_time();
-        const uint32_t frameAgeMs = (framePublishUs > 0 && nowUs > framePublishUs)
-            ? (uint32_t)((nowUs - framePublishUs) / 1000)
-            : 0;
-
-        bool frameFailed = false;
-        for (uint16_t chunkIndex = 0; chunkIndex < chunkCount; chunkIndex++) {
-            const size_t offset = chunkIndex * kMaxPayload;
-            const size_t remaining = frameLen - offset;
-            const uint16_t payloadLen = (uint16_t)((remaining > (size_t)kMaxPayload) ? kMaxPayload : remaining);
-
-            UdpFrameHeader header = {};
-            header.magic = htonl(kMagic);
-            header.frameSeq = htonl(frameSeq);
-            header.chunkIndex = htons(chunkIndex);
-            header.chunkCount = htons(chunkCount);
-            header.payloadLen = htons(payloadLen);
-            header.frameLen = htons((uint16_t)frameLen);
-            header.frameAgeMs = htonl(frameAgeMs);
-
-            memcpy(packet, &header, sizeof(header));
-            memcpy(packet + sizeof(header), frameSnapshot + offset, payloadLen);
-
-            int sent = sendto(sock,
-                              packet,
-                              sizeof(header) + payloadLen,
-                              0,
-                              (struct sockaddr *)&clientAddr,
-                              clientAddrLen);
-            if (sent < 0) {
-                txErrors++;
-                frameFailed = true;
-                break;
-            }
-            txChunks++;
-        }
-
-        if (!frameFailed) {
-            lastSentSeq = frameSeq;
-            txFrames++;
-        }
-
-        const int64_t elapsedUs = nowUs - txWindowStartUs;
-        if (elapsedUs >= 2000000) {
-            const float fps = (txFrames * 1000000.0f) / (float)elapsedUs;
-            ESP_LOGI("UDP_STREAM",
-                     "tx_fps=%.2f | frames=%lu | chunks=%lu | err=%lu | last_seq=%lu | frame_len=%u",
-                     fps,
-                     (unsigned long)txFrames,
-                     (unsigned long)txChunks,
-                     (unsigned long)txErrors,
-                     (unsigned long)lastSentSeq,
-                     (unsigned int)frameLen);
-            txWindowStartUs = nowUs;
-            txFrames = 0;
-            txChunks = 0;
-            txErrors = 0;
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(1));
-    }
 }
 
 static void operateCameraResetSequence()
@@ -872,18 +531,18 @@ extern "C" void app_main(void)
         ESP_LOGW(OV2640_TAG, "Failed to get camera sensor handle for flipping");
     }
 
-    if (!initPublishedHttpFrameStore()) {
+    if (!httpFrameBuffer.initPublishedHttpFrameStore(kPublishedFrameMaxBytes, MALLOC_CAP_SPIRAM)) {
         return;
     }
 
     #if ENABLE_RGB_STREAM_TASK
-        if (!streamMailboxManager.initFrameMailbox("stream", kPublishedFrameMaxBytes, MALLOC_CAP_SPIRAM)) {
+        if (!streamMailboxManager.initFrameMailbox("stream", MALLOC_CAP_SPIRAM)) {
             return;
         }
     #endif
 
     #if ENABLE_INFERENCE
-        if (!inferenceMailboxManager.initFrameMailbox("inference", kPublishedFrameMaxBytes, MALLOC_CAP_SPIRAM)) {
+        if (!inferenceMailboxManager.initFrameMailbox("inference", MALLOC_CAP_SPIRAM)) {
             return;
         }
     #endif
@@ -891,8 +550,8 @@ extern "C" void app_main(void)
     // HTTP server task (always on; transport-specific handlers are configured below).
     auto http_server_task = [](void* arg) {
         #if USE_TCP
-            server.setCaptureHandler(captureRgbCallback);
-            server.setStreamHandler(streamTcpRgbCallback);
+            server.setCaptureHandler(captureRgbTcpCallback);
+            server.setStreamHandler(streamRgbTcpCallback);
         #endif
 
         if (server.start() == ESP_OK) {
@@ -920,10 +579,15 @@ extern "C" void app_main(void)
     #if USE_UDP
         ESP_LOGI(OV2640_TAG, "UDP mode active. Stream port: %d", UDP_STREAM_PORT);
         xTaskCreatePinnedToCore(
-            udp_stream_task,
+            [&server](void* arg) { 
+                CameraHttpServer* serverPtr = static_cast<CameraHttpServer*>(arg);
+                if (serverPtr) {
+                    serverPtr->udp_stream_task(arg);
+                }
+            },
             "udp_stream_task",
             6144,
-            NULL,
+            &server,
             5,
             NULL,
             0
@@ -932,10 +596,15 @@ extern "C" void app_main(void)
 
     #if ENABLE_RGB_STREAM_TASK
         xTaskCreatePinnedToCore(
-            stream_publish_task,
-            "stream_publish_task",
+            [&server](void* arg) { 
+                CameraHttpServer* serverPtr = static_cast<CameraHttpServer*>(arg);
+                if (serverPtr) {
+                    serverPtr->http_stream_publish_task(arg);
+                }
+            },
+            "http_stream_publish_task",
             6144,
-            NULL,
+            &server,
             5,
             &streamMailbox.consumerTaskHandle,
             tskNO_AFFINITY
