@@ -2,6 +2,7 @@ idf_component_register(
     SRCS "wifi/wifi.cpp"
          "http-server/http-server.cpp"
          "camera-driver/camera-driver.cpp"
+         "data-types/frame-mailbox.cpp"
          "tf-lite/tf-lite.cpp"
          "main.cpp"
          "tflite-person-detect/person_detect_model_data.cc"

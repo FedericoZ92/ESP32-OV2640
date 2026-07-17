@@ -6,6 +6,10 @@
 #include "esp_heap_caps.h"
 #include "esp_system.h"
 #include "app-globals.h"
+#include "data-types/frame-snapshot.h"
+#include "data-types/frame-mailbox.h"
+#include "image-editing/editing.h"
+#include "util/misc.h"
 #include "debug.h"
 
 bool TfLiteWrapper::init(const unsigned char* model_data, size_t arena_size_, uint8_t* arena_buffer)
@@ -188,61 +192,64 @@ TfLiteTensor* TfLiteWrapper::getInputTensor() {
     return interpreter ? interpreter->input(0) : nullptr;
 }
 
-#if ENABLE_INFERENCE
-void inference_task(void *arg)
+
+void TfLiteWrapper::inference_task(void *arg)
 {
-    ESP_LOGI(TF_TAG, "Inference task started");
+    #if ENABLE_INFERENCE
+        ESP_LOGI(TF_TAG, "Inference task started");
 
-    uint8_t* grayscaleWorkspace = (uint8_t*)heap_caps_malloc(kAcquiredFrameMaxPixels, MALLOC_CAP_8BIT);
-    uint8_t* gray96Buffer = (uint8_t*)heap_caps_malloc(TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE, MALLOC_CAP_8BIT);
-    if (!grayscaleWorkspace || !gray96Buffer) {
-        ESP_LOGE(TF_TAG, "Failed to allocate inference workspace");
-        vTaskDelete(NULL);
-        return;
-    }
-
-    uint32_t lastSeenSeq = 0;
-
-    while (true) {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-
-        FrameSnapshot snapshot = {};
-        if (!snapshotMailbox(&inferenceMailbox, &snapshot) || snapshot.seq == lastSeenSeq) {
-            continue;
+        uint8_t* grayscaleWorkspace = (uint8_t*)heap_caps_malloc(kAcquiredFrameMaxPixels, MALLOC_CAP_8BIT);
+        uint8_t* gray96Buffer = (uint8_t*)heap_caps_malloc(TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE, MALLOC_CAP_8BIT);
+        if (!grayscaleWorkspace || !gray96Buffer) {
+            ESP_LOGE(TF_TAG, "Failed to allocate inference workspace");
+            vTaskDelete(NULL);
+            return;
         }
 
-        tensorFlowTimer.checkpoint();
-        jpegTimer.checkpoint();
-        const bool prepared = buildGray96Frame(snapshot,
-                                               grayscaleWorkspace,
-                                               kAcquiredFrameMaxPixels,
-                                               gray96Buffer);
-        jpegTimer.logCheckpoint(JPEG_TAG, "inference input prepared");
-        if (!prepared) {
-            lastSeenSeq = snapshot.seq;
-            continue;
-        }
+        uint32_t lastSeenSeq = 0;
 
-        TfLiteTensor* input = tf_wrapper.getInputTensor();
-        if (input && input->dims && input->dims->size >= 4) {
-            logFirstPixels(TF_TAG, "gray96Buffer", gray96Buffer, 10);
-            bool person_present = tf_wrapper.runInference(gray96Buffer, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE);
-            ESP_LOGW(TF_TAG, "Person detected? %s", person_present ? "YES" : "NO");
-            if (person_present) {
-                redLed.setLedGpio2(0);
-                rgb.turnBlueLedOn();
-            } else {
-                redLed.setLedGpio2(1);
-                rgb.turnRedLedOn();
+        while (true) {
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+            FrameSnapshot snapshot = {};
+            if (!inferenceMailboxManager.snapshot(&snapshot) || snapshot.seq == lastSeenSeq) {
+                continue;
             }
-        } else {
-            ESP_LOGE(TF_TAG, "Input tensor is null or malformed");
-        }
 
-        tensorFlowTimer.logCheckpoint(TF_TAG, "tf inference done");
-        lastSeenSeq = snapshot.seq;
-    }
+            tensorFlowTimer.checkpoint();
+            jpegTimer.checkpoint();
+            const bool prepared = buildGray96Frame(snapshot,
+                                                    grayscaleWorkspace,
+                                                    kAcquiredFrameMaxPixels,
+                                                    gray96Buffer,
+                                                    TF_IMAGE_INPUT_SIZE);
+            jpegTimer.logCheckpoint(JPEG_TAG, "inference input prepared");
+            if (!prepared) {
+                lastSeenSeq = snapshot.seq;
+                continue;
+            }
+
+            TfLiteTensor* input = getInputTensor();
+            if (input && input->dims && input->dims->size >= 4) {
+                logFirstPixels(TF_TAG, "gray96Buffer", gray96Buffer, 10);
+                bool person_present = runInference(gray96Buffer, TF_IMAGE_INPUT_SIZE, TF_IMAGE_INPUT_SIZE);
+                ESP_LOGW(TF_TAG, "Person detected? %s", person_present ? "YES" : "NO");
+                if (person_present) {
+                    redLed.setLedGpio2(0);
+                    rgb.turnBlueLedOn();
+                } else {
+                    redLed.setLedGpio2(1);
+                    rgb.turnRedLedOn();
+                }
+            } else {
+                ESP_LOGE(TF_TAG, "Input tensor is null or malformed");
+            }
+
+            tensorFlowTimer.logCheckpoint(TF_TAG, "tf inference done");
+            lastSeenSeq = snapshot.seq;
+        }
+    #endif
 }
-#endif
+
 
 

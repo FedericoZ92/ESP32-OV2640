@@ -20,6 +20,9 @@ public:
     // Release a previously captured frame. The frame buffer to release.
     void releaseFrame(camera_fb_t* fb);
 
+    // Background task: capture frames and hand them to downstream consumers.
+    void capture_task(void *arg);
+
 private:
     camera_config_t config;
 

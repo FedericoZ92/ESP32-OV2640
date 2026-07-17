@@ -1,17 +1,4 @@
-#include <stdio.h>
-#include <cstring>
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
-#include <freertos/semphr.h>
-#include <esp_system.h>
-#include <esp_log.h>
-#include <esp_chip_info.h>
-#include <esp_flash.h>
-#include <esp_timer.h>
-#include <esp_camera.h>
-#include <lwip/sockets.h>
-#include <lwip/inet.h>
-#include <lwip/netdb.h>
+
 #include "camera-driver/camera-driver.h"
 #include "http-server/http-server.h"
 #include "wifi/wifi.h"
@@ -28,6 +15,21 @@
 #include "checkpoint-timer/checkpoint-timer.h"
 #include "util/misc.h"
 #include "define.h"
+#include "data-types/frame-mailbox.h"
+#include <stdio.h>
+#include <cstring>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
+#include <esp_system.h>
+#include <esp_log.h>
+#include <esp_chip_info.h>
+#include <esp_flash.h>
+#include <esp_timer.h>
+#include <esp_camera.h>
+#include <lwip/sockets.h>
+#include <lwip/inet.h>
+#include <lwip/netdb.h>
 
 // OV2640 pin map for ESP32-S3-CAM-N16R8
 // https://www.oceanlabz.in/getting-started-with-esp32-s3-wroom-n16r8-cam-dev-board/?srsltid=AfmBOors-1xeo_-CM5mcneEFHgQY9ps0qX2SHt8gf-S7Ndizot0T4vzk
@@ -57,68 +59,18 @@ static volatile uint16_t activeHttpFrameHeight = TF_IMAGE_INPUT_SIZE;
 static volatile pixformat_t activeHttpFrameFormat = PIXFORMAT_GRAYSCALE;
 static volatile uint32_t activeHttpFrameSeq = 0;
 static volatile int64_t activeHttpFramePublishUs = 0;
-static volatile bool pauseCameraAcquisition = false;
+
+volatile bool pauseCameraAcquisition = false;
+
 static portMUX_TYPE httpFrameMetaLock = portMUX_INITIALIZER_UNLOCKED;
 static TfLiteWrapper tf_wrapper;
 
-// Large enough for QQVGA grayscale and worst-case QQVGA JPEG payload bursts.
-static constexpr size_t kPublishedFrameMaxBytes =
-    (JPEG_BUFFER_SIZE > (160 * 120 * 2) ? JPEG_BUFFER_SIZE : (160 * 120 * 2));
+FrameMailbox inferenceMailbox;
+FrameMailbox streamMailbox;
+FrameMailboxManager inferenceMailboxManager(&inferenceMailbox);
+FrameMailboxManager streamMailboxManager(&streamMailbox);
 
-// The current inference camera mode is QQVGA, so a full grayscale scratch frame fits here.
-static constexpr size_t kAcquiredFrameMaxPixels = 160 * 120;
 
-struct FrameMailbox {
-    uint8_t* buffers[2] = {nullptr, nullptr};
-    volatile uint8_t activeIndex = 0;
-    volatile size_t frameLen = 0;
-    volatile uint16_t frameWidth = 0;
-    volatile uint16_t frameHeight = 0;
-    volatile pixformat_t frameFormat = PIXFORMAT_GRAYSCALE;
-    volatile uint32_t frameSeq = 0;
-    volatile int64_t frameCaptureUs = 0;
-    portMUX_TYPE lock = portMUX_INITIALIZER_UNLOCKED;
-    TaskHandle_t consumerTaskHandle = nullptr;
-    const char* tag = nullptr;
-};
-
-struct FrameSnapshot {
-    const uint8_t* data = nullptr;
-    size_t len = 0;
-    uint16_t width = 0;
-    uint16_t height = 0;
-    pixformat_t format = PIXFORMAT_GRAYSCALE;
-    uint32_t seq = 0;
-    int64_t captureUs = 0;
-};
-
-static FrameMailbox inferenceMailbox;
-static FrameMailbox streamMailbox;
-
-static bool initFrameMailbox(FrameMailbox* mailbox, const char* tag)
-{
-    if (!mailbox) {
-        return false;
-    }
-
-    mailbox->tag = tag;
-    mailbox->buffers[0] = (uint8_t*)heap_caps_malloc(kPublishedFrameMaxBytes, MALLOC_CAP_SPIRAM);
-    mailbox->buffers[1] = (uint8_t*)heap_caps_malloc(kPublishedFrameMaxBytes, MALLOC_CAP_SPIRAM);
-    if (!mailbox->buffers[0] || !mailbox->buffers[1]) {
-        ESP_LOGE(MAIN_TAG, "Failed to allocate mailbox buffers for %s", tag ? tag : "unknown");
-        return false;
-    }
-
-    mailbox->activeIndex = 0;
-    mailbox->frameLen = 0;
-    mailbox->frameWidth = 0;
-    mailbox->frameHeight = 0;
-    mailbox->frameFormat = PIXFORMAT_GRAYSCALE;
-    mailbox->frameSeq = 0;
-    mailbox->frameCaptureUs = 0;
-    mailbox->consumerTaskHandle = nullptr;
-    return true;
-}
 
 static bool initPublishedHttpFrameStore()
 {
@@ -136,69 +88,6 @@ static bool initPublishedHttpFrameStore()
     activeHttpFrameSeq = 0;
     activeHttpFramePublishUs = 0;
     return true;
-}
-
-static void publishToMailbox(FrameMailbox* mailbox,
-                             const uint8_t* src,
-                             size_t srcLen,
-                             uint16_t width,
-                             uint16_t height,
-                             pixformat_t format,
-                             int64_t captureUs)
-{
-    if (!mailbox || !src || srcLen == 0) {
-        return;
-    }
-
-    size_t frameLen = srcLen;
-    if (frameLen > kPublishedFrameMaxBytes) {
-        ESP_LOGW(MAIN_TAG,
-                 "Mailbox %s frame too large (%u > %u), truncating",
-                 mailbox->tag ? mailbox->tag : "unknown",
-                 (unsigned int)frameLen,
-                 (unsigned int)kPublishedFrameMaxBytes);
-        frameLen = kPublishedFrameMaxBytes;
-    }
-
-    uint8_t publishIndex = mailbox->activeIndex ^ 1;
-    if (!mailbox->buffers[publishIndex]) {
-        return;
-    }
-
-    memcpy(mailbox->buffers[publishIndex], src, frameLen);
-    taskENTER_CRITICAL(&mailbox->lock);
-    mailbox->frameLen = frameLen;
-    mailbox->frameWidth = width;
-    mailbox->frameHeight = height;
-    mailbox->frameFormat = format;
-    mailbox->activeIndex = publishIndex;
-    mailbox->frameSeq++;
-    mailbox->frameCaptureUs = captureUs;
-    taskEXIT_CRITICAL(&mailbox->lock);
-
-    if (mailbox->consumerTaskHandle) {
-        xTaskNotifyGive(mailbox->consumerTaskHandle);
-    }
-}
-
-static bool snapshotMailbox(FrameMailbox* mailbox, FrameSnapshot* snapshot)
-{
-    if (!mailbox || !snapshot) {
-        return false;
-    }
-
-    taskENTER_CRITICAL(&mailbox->lock);
-    const uint8_t activeIndex = mailbox->activeIndex;
-    snapshot->len = mailbox->frameLen;
-    snapshot->width = mailbox->frameWidth;
-    snapshot->height = mailbox->frameHeight;
-    snapshot->format = mailbox->frameFormat;
-    snapshot->seq = mailbox->frameSeq;
-    snapshot->captureUs = mailbox->frameCaptureUs;
-    taskEXIT_CRITICAL(&mailbox->lock);
-
-    snapshot->data = mailbox->buffers[activeIndex];
-    return snapshot->data != nullptr && snapshot->len > 0;
 }
 
 static void publishHttpFrame(const uint8_t* src,
@@ -246,172 +135,6 @@ static void publishHttpFrame(const uint8_t* src,
     #endif
 }
 
-static bool buildGray96Frame(const FrameSnapshot& snapshot,
-                             uint8_t* grayscaleWorkspace,
-                             size_t grayscaleWorkspaceLen,
-                             uint8_t* gray96Buffer)
-{
-    if (!snapshot.data || !grayscaleWorkspace || !gray96Buffer) {
-        return false;
-    }
-
-    if (snapshot.width < TF_IMAGE_INPUT_SIZE || snapshot.height < TF_IMAGE_INPUT_SIZE) {
-        ESP_LOGW(CAPTURE_TAG, "Frame too small to resize to 96x96");
-        return false;
-    }
-
-    const size_t pixelCount = (size_t)snapshot.width * (size_t)snapshot.height;
-    if (pixelCount > grayscaleWorkspaceLen) {
-        ESP_LOGW(CAPTURE_TAG,
-                 "Frame scratch buffer too small (%u > %u)",
-                 (unsigned int)pixelCount,
-                 (unsigned int)grayscaleWorkspaceLen);
-        return false;
-    }
-
-    switch (snapshot.format) {
-        case PIXFORMAT_GRAYSCALE:
-            return cropCenter(snapshot.data,
-                              snapshot.width,
-                              snapshot.height,
-                              gray96Buffer,
-                              TF_IMAGE_INPUT_SIZE,
-                              TF_IMAGE_INPUT_SIZE,
-                              1);
-
-        case PIXFORMAT_RGB565:
-            convertRgb565ToGrayscale((const uint16_t*)snapshot.data,
-                                     grayscaleWorkspace,
-                                     snapshot.width,
-                                     snapshot.height);
-            return cropCenter(grayscaleWorkspace,
-                              snapshot.width,
-                              snapshot.height,
-                              gray96Buffer,
-                              TF_IMAGE_INPUT_SIZE,
-                              TF_IMAGE_INPUT_SIZE,
-                              1);
-
-        case PIXFORMAT_RGB888:
-            convertRgb888ToGrayscale(snapshot.data,
-                                     grayscaleWorkspace,
-                                     snapshot.width,
-                                     snapshot.height);
-            return cropCenter(grayscaleWorkspace,
-                              snapshot.width,
-                              snapshot.height,
-                              gray96Buffer,
-                              TF_IMAGE_INPUT_SIZE,
-                              TF_IMAGE_INPUT_SIZE,
-                              1);
-
-        case PIXFORMAT_JPEG: {
-            camera_fb_t jpegFrame = {};
-            jpegFrame.buf = (uint8_t*)snapshot.data;
-            jpegFrame.len = snapshot.len;
-            jpegFrame.width = snapshot.width;
-            jpegFrame.height = snapshot.height;
-            jpegFrame.format = PIXFORMAT_JPEG;
-
-            uint8_t* decodedRgb565 = allocatingDecodeCameraJpeg(&jpegFrame,
-                                                                 MALLOC_CAP_SPIRAM,
-                                                                 JPEG_IMAGE_FORMAT_RGB565,
-                                                                 JPEG_IMAGE_SCALE_0);
-            if (!decodedRgb565) {
-                ESP_LOGE(CAPTURE_TAG, "JPEG decode failed");
-                return false;
-            }
-
-            convertRgb565ToGrayscale((const uint16_t*)decodedRgb565,
-                                     grayscaleWorkspace,
-                                     snapshot.width,
-                                     snapshot.height);
-            const bool ok = cropCenter(grayscaleWorkspace,
-                                       snapshot.width,
-                                       snapshot.height,
-                                       gray96Buffer,
-                                       TF_IMAGE_INPUT_SIZE,
-                                       TF_IMAGE_INPUT_SIZE,
-                                       1);
-            heap_caps_free(decodedRgb565);
-            return ok;
-        }
-
-        default:
-            ESP_LOGW(CAPTURE_TAG, "Unsupported pixel format %d", snapshot.format);
-            return false;
-    }
-}
-
-// Background task: capture frames and hand them to downstream consumers.
-void capture_task(void *arg)
-{
-    ESP_LOGI(CAPTURE_TAG, "Camera capture task started");
-    uint32_t capturedFrames = 0;
-    int64_t captureWindowStartUs = esp_timer_get_time();
-
-    while (true) {
-        if (pauseCameraAcquisition) {
-            // Freeze mode keeps serving the last published frame to isolate HTTP/network speed.
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
-
-        // --- Handle JPEG decoding or raw frame ---
-        ESP_LOGD(CAPTURE_TAG, "Handle JPEG decoding or raw frame, mark checkpoint"); 
-        cameraAcquisitionTimer.checkpoint();
-        camera_fb_t *frameBuffer = esp_camera_fb_get();
-        if (!frameBuffer) {
-            ESP_LOGW(CAPTURE_TAG, "Failed to get frame buffer");
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
-        }
-        ESP_LOGD(CAPTURE_TAG, "Frame: %dx%d, len=%d, format=%d", frameBuffer->width, frameBuffer->height, frameBuffer->len, frameBuffer->format);
-        cameraAcquisitionTimer.logCheckpoint(CAPTURE_TAG, "frame captured");
-
-        const int64_t captureUs = esp_timer_get_time();
-
-        #if ENABLE_RGB_STREAM_TASK
-            publishToMailbox(&streamMailbox,
-                             frameBuffer->buf,
-                             frameBuffer->len,
-                             frameBuffer->width,
-                             frameBuffer->height,
-                             frameBuffer->format,
-                             captureUs);
-        #endif
-
-        #if ENABLE_INFERENCE
-            publishToMailbox(&inferenceMailbox,
-                             frameBuffer->buf,
-                             frameBuffer->len,
-                             frameBuffer->width,
-                             frameBuffer->height,
-                             frameBuffer->format,
-                             captureUs);
-        #endif
-
-        capturedFrames++;
-        const int64_t elapsedUs = captureUs - captureWindowStartUs;
-        if (elapsedUs >= 2000000) {
-            const float captureFps = (capturedFrames * 1000000.0f) / (float)elapsedUs;
-            ESP_LOGI(CAPTURE_TAG,
-                     "Capture FPS: %.2f | latest frame=%dx%d fmt=%d len=%d",
-                     captureFps,
-                     frameBuffer->width,
-                     frameBuffer->height,
-                     frameBuffer->format,
-                     frameBuffer->len);
-            capturedFrames = 0;
-            captureWindowStartUs = captureUs;
-        }
-
-        esp_camera_fb_return(frameBuffer);
-
-        // Yield to networking/HTTP tasks to avoid burst-and-freeze behavior.
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-}
 
 void stream_publish_task(void *arg)
 {
@@ -433,7 +156,8 @@ void stream_publish_task(void *arg)
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
 
         FrameSnapshot snapshot = {};
-        if (!snapshotMailbox(&streamMailbox, &snapshot) || snapshot.seq == lastSeenSeq) {
+        bool snapshotResult = streamMailboxManager.snapshot(&snapshot);
+        if (!snapshotResult || snapshot.seq == lastSeenSeq) {
             continue;
         }
 
@@ -454,7 +178,8 @@ void stream_publish_task(void *arg)
                 } else if (buildGray96Frame(snapshot,
                                             grayscaleWorkspace,
                                             kAcquiredFrameMaxPixels,
-                                            gray96Buffer)) {
+                                            gray96Buffer,
+                                            TF_IMAGE_INPUT_SIZE)) {
                     publishSrc = gray96Buffer;
                     publishLen = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE;
                     publishWidth = TF_IMAGE_INPUT_SIZE;
@@ -465,8 +190,9 @@ void stream_publish_task(void *arg)
                 if (buildGray96Frame(snapshot,
                                      grayscaleWorkspace,
                                      kAcquiredFrameMaxPixels,
-                                     gray96Buffer)) {
-                    publishSrc = gray96Buffer;
+                                     kAcquiredFrameMaxPixels,
+                                     gray96Buffer,
+                                     TF_IMAGE_INPUT_SIZE)) {
                     publishLen = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE;
                     publishWidth = TF_IMAGE_INPUT_SIZE;
                     publishHeight = TF_IMAGE_INPUT_SIZE;
@@ -1053,6 +779,20 @@ void udp_stream_task(void *arg)
     }
 }
 
+static void operateCameraResetSequence()
+{
+    gpio_reset_pin((gpio_num_t)PWDN_GPIO_NUM);
+    gpio_reset_pin((gpio_num_t)RESET_GPIO_NUM);
+    gpio_set_direction((gpio_num_t)PWDN_GPIO_NUM, GPIO_MODE_OUTPUT);
+    gpio_set_direction((gpio_num_t)RESET_GPIO_NUM, GPIO_MODE_OUTPUT);
+
+    gpio_set_level((gpio_num_t)PWDN_GPIO_NUM, 0);  // Power on
+    gpio_set_level((gpio_num_t)RESET_GPIO_NUM, 0); // Hold reset
+    vTaskDelay(pdMS_TO_TICKS(10));
+    gpio_set_level((gpio_num_t)RESET_GPIO_NUM, 1); // Release reset
+
+}
+
 extern "C" void app_main(void)
 {
     esp_log_level_set("*", ESP_LOG_WARN);
@@ -1075,15 +815,7 @@ extern "C" void app_main(void)
     ESP_LOGI(OV2640_TAG, "Flash size: %" PRIu32 " MB", flash_size / (1024 * 1024));
 
     // --- Camera reset sequence ---
-    gpio_reset_pin((gpio_num_t)PWDN_GPIO_NUM);
-    gpio_reset_pin((gpio_num_t)RESET_GPIO_NUM);
-    gpio_set_direction((gpio_num_t)PWDN_GPIO_NUM, GPIO_MODE_OUTPUT);
-    gpio_set_direction((gpio_num_t)RESET_GPIO_NUM, GPIO_MODE_OUTPUT);
-
-    gpio_set_level((gpio_num_t)PWDN_GPIO_NUM, 0);  // Power on
-    gpio_set_level((gpio_num_t)RESET_GPIO_NUM, 0); // Hold reset
-    vTaskDelay(pdMS_TO_TICKS(10));
-    gpio_set_level((gpio_num_t)RESET_GPIO_NUM, 1); // Release reset
+    operateCameraResetSequence();
     vTaskDelay(pdMS_TO_TICKS(100));
 
     // --- Allocate TensorFlow Lite arena intelligently ---
@@ -1145,13 +877,13 @@ extern "C" void app_main(void)
     }
 
     #if ENABLE_RGB_STREAM_TASK
-        if (!initFrameMailbox(&streamMailbox, "stream")) {
+        if (!streamMailboxManager.initFrameMailbox("stream", kPublishedFrameMaxBytes, MALLOC_CAP_SPIRAM)) {
             return;
         }
     #endif
 
     #if ENABLE_INFERENCE
-        if (!initFrameMailbox(&inferenceMailbox, "inference")) {
+        if (!inferenceMailboxManager.initFrameMailbox("inference", kPublishedFrameMaxBytes, MALLOC_CAP_SPIRAM)) {
             return;
         }
     #endif
@@ -1215,10 +947,15 @@ extern "C" void app_main(void)
 
     #if ENABLE_INFERENCE
         xTaskCreatePinnedToCore(
-            [](void* arg) { tf_wrapper.inference_task(arg); },
+            [&tf_wrapper](void* arg) { 
+                TfLiteWrapper* wrapperPtr = static_cast<TfLiteWrapper*>(arg); 
+                if(wrapperPtr) {
+                    tf_wrapper.inference_task(wrapperPtr);
+                }
+            },
             "inference_task",
             6144,
-            NULL,
+            &tf_wrapper,
             5,
             &inferenceMailbox.consumerTaskHandle,
             tskNO_AFFINITY
@@ -1230,10 +967,16 @@ extern "C" void app_main(void)
 
     // --- Start capture task ---
     #if ENABLE_CAMERA_ACQUISITION_TASK
-        xTaskCreatePinnedToCore(capture_task,
+        xTaskCreatePinnedToCore( 
+                                [](void* arg) {
+                                    CameraDriver* cameraPtr = static_cast<CameraDriver*>(arg);
+                                    if (cameraPtr) {
+                                        cameraPtr->capture_task(arg);
+                                    }
+                                },
                                 "capture_task",
                                 4096,
-                                NULL,
+                                &camera,
                                 5,
                                 NULL,
                                 1); //xCoreID 0 for main core, 1 for app core

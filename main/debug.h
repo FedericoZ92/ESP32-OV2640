@@ -4,7 +4,8 @@
 #include <string>
 
 
-#define OV2640_TAG  "_____ov2640" //11
+#define OV2640_TAG  "_____OV2640" //11
+#define CAMERA_TAG  "_____Camera"
 #define CAPTURE_TAG "CaptureTask"
 #define TF_TAG      "TfLiteWrapp"
 #define RAM_TAG     "________RAM"

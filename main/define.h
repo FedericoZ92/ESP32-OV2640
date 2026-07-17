@@ -25,7 +25,7 @@
 
 // Enable TensorFlow inference path in capture_task when set to 1.
 // Set to 0 to suspend inference for streaming performance tests.
-#define ENABLE_INFERENCE 0
+#define ENABLE_INFERENCE 1
 
 // Enable browser fallback from /stream.rgb to /capture.rgb polling when set to 1.
 #define ENABLE_POLLING_FALLBACK 0

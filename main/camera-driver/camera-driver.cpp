@@ -2,8 +2,10 @@
 #include "camera-driver.h"
 #include "esp_log.h"
 #include "define.h"
-
-static const char *TAG = "CameraDriver";
+#include "debug.h"
+#include "app-globals.h"
+#include "data-types/frame-mailbox.h"
+#include <esp_timer.h>
 
 #define PWDN_GPIO_NUM     -1   // Power down not used
 #define RESET_GPIO_NUM    -1   // Reset not used
@@ -63,9 +65,9 @@ void CameraDriver::configureCamera() {
 esp_err_t CameraDriver::init() {
     esp_err_t err = esp_camera_init(&config);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Camera initialization failed: 0x%x", err);
+        ESP_LOGE(CAMERA_TAG, "Camera initialization failed: 0x%x", err);
     } else {
-        ESP_LOGI(TAG, "Camera successfully initialized");
+        ESP_LOGI(CAMERA_TAG, "Camera successfully initialized");
     }
     return err;
 }
@@ -73,17 +75,88 @@ esp_err_t CameraDriver::init() {
 camera_fb_t* CameraDriver::captureFrame() {
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
-        ESP_LOGE(TAG, "Failed to capture frame");
+        ESP_LOGE(CAMERA_TAG, "Failed to capture frame");
         return nullptr;
     }
-    ESP_LOGI(TAG, "Captured frame size: %d bytes", fb->len);
+    ESP_LOGI(CAMERA_TAG, "Captured frame size: %d bytes", fb->len);
     return fb;
 }
 
 void CameraDriver::releaseFrame(camera_fb_t* fb) {
     if (fb) {
         esp_camera_fb_return(fb);
-        ESP_LOGI(TAG, "Frame buffer released");
+        ESP_LOGI(CAMERA_TAG, "Frame buffer released");
+    }
+}
+
+// Background task: capture frames and hand them to downstream consumers.
+void CameraDriver::capture_task(void *arg)
+{
+    ESP_LOGI(CAPTURE_TAG, "Camera capture task started");
+    uint32_t capturedFrames = 0;
+    int64_t captureWindowStartUs = esp_timer_get_time();
+
+    while (true) {
+        if (pauseCameraAcquisition) {
+            // Freeze mode keeps serving the last published frame to isolate HTTP/network speed.
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        // --- Handle JPEG decoding or raw frame ---
+        ESP_LOGD(CAPTURE_TAG, "Handle JPEG decoding or raw frame, mark checkpoint"); 
+        cameraAcquisitionTimer.checkpoint();
+        camera_fb_t *frameBuffer = esp_camera_fb_get();
+        if (!frameBuffer) {
+            ESP_LOGW(CAPTURE_TAG, "Failed to get frame buffer");
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+        ESP_LOGD(CAPTURE_TAG, "Frame: %dx%d, len=%d, format=%d", frameBuffer->width, frameBuffer->height, frameBuffer->len, frameBuffer->format);
+        cameraAcquisitionTimer.logCheckpoint(CAPTURE_TAG, "frame captured");
+
+        const int64_t captureUs = esp_timer_get_time();
+
+        #if ENABLE_RGB_STREAM_TASK
+            streamMailboxManager.publish(  
+                                kPublishedFrameMaxBytes,
+                                frameBuffer->buf,
+                                frameBuffer->len,
+                                frameBuffer->width,
+                                frameBuffer->height,
+                                frameBuffer->format,
+                                captureUs);
+        #endif
+        #if ENABLE_INFERENCE
+            inferenceMailboxManager.publish(
+                                kPublishedFrameMaxBytes,
+                                frameBuffer->buf,
+                                frameBuffer->len,
+                                frameBuffer->width,
+                                frameBuffer->height,
+                                frameBuffer->format,
+                                captureUs);
+        #endif
+
+        capturedFrames++;
+        const int64_t elapsedUs = captureUs - captureWindowStartUs;
+        if (elapsedUs >= 2000000) {
+            const float captureFps = (capturedFrames * 1000000.0f) / (float)elapsedUs;
+            ESP_LOGI(CAPTURE_TAG,
+                     "Capture FPS: %.2f | latest frame=%dx%d fmt=%d len=%d",
+                     captureFps,
+                     frameBuffer->width,
+                     frameBuffer->height,
+                     frameBuffer->format,
+                     frameBuffer->len);
+            capturedFrames = 0;
+            captureWindowStartUs = captureUs;
+        }
+
+        esp_camera_fb_return(frameBuffer);
+
+        // Yield to networking/HTTP tasks to avoid burst-and-freeze behavior.
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 

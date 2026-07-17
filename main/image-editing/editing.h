@@ -1,4 +1,6 @@
 #pragma once
+
+#include "data-types/frame-snapshot.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <esp_camera.h>
@@ -40,3 +42,9 @@ void convertGrayscaleToRgb888(const uint8_t* grayscale,
                                 uint8_t* rgb, 
                                 int width, 
                                 int height);
+
+bool buildGray96Frame(const FrameSnapshot& snapshot,
+                      uint8_t* grayscaleWorkspace,
+                      size_t grayscaleWorkspaceLen,
+                      uint8_t* gray96Buffer,
+                      size_t tfImageInputSize);

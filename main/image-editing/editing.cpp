@@ -4,6 +4,7 @@
 //#include "esp_jpeg.h" //"esp_jpeg_decoder.h"   // or <esp_jpeg.h> depending on your SDK
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "debug.h"
 
 
 void resizeRgbNearestNeighbor(const uint8_t* src, int in_width, int in_height,
@@ -121,6 +122,105 @@ void convertGrayscaleToRgb888(const uint8_t* grayscale, uint8_t* rgb, int width,
         rgb[i * 3 + 0] = val;  // R
         rgb[i * 3 + 1] = val;  // G
         rgb[i * 3 + 2] = val;  // B
+    }
+}
+
+
+bool buildGray96Frame(const FrameSnapshot& snapshot,
+                        uint8_t* grayscaleWorkspace,
+                        size_t grayscaleWorkspaceLen,
+                        uint8_t* gray96Buffer,
+                        size_t tfImageInputSize)
+{
+    if (!snapshot.data || !grayscaleWorkspace || !gray96Buffer) {
+        return false;
+    }
+
+    if (snapshot.width < tfImageInputSize || snapshot.height < tfImageInputSize) {
+        ESP_LOGW(CAPTURE_TAG, "Frame too small to resize to %ux%u", (unsigned int)tfImageInputSize, (unsigned int)tfImageInputSize);
+        return false;
+    }
+
+    const size_t pixelCount = (size_t)snapshot.width * (size_t)snapshot.height;
+    if (pixelCount > grayscaleWorkspaceLen) {
+        ESP_LOGW(CAPTURE_TAG,
+                 "Frame scratch buffer too small (%u > %u)",
+                 (unsigned int)pixelCount,
+                 (unsigned int)grayscaleWorkspaceLen);
+        return false;
+    }
+
+    switch (snapshot.format) {
+        case PIXFORMAT_GRAYSCALE:
+            return cropCenter(snapshot.data,
+                              snapshot.width,
+                              snapshot.height,
+                              gray96Buffer,
+                              tfImageInputSize,
+                              tfImageInputSize,
+                              1);
+
+        case PIXFORMAT_RGB565:
+            convertRgb565ToGrayscale((const uint16_t*)snapshot.data,
+                                     grayscaleWorkspace,
+                                     snapshot.width,
+                                     snapshot.height);
+            return cropCenter(grayscaleWorkspace,
+                              snapshot.width,
+                              snapshot.height,
+                              gray96Buffer,
+                              tfImageInputSize,
+                              tfImageInputSize,
+                              1);
+
+        case PIXFORMAT_RGB888:
+            convertRgb888ToGrayscale(snapshot.data,
+                                     grayscaleWorkspace,
+                                     snapshot.width,
+                                     snapshot.height);
+            return cropCenter(grayscaleWorkspace,
+                              snapshot.width,
+                              snapshot.height,
+                              gray96Buffer,
+                              tfImageInputSize,
+                              tfImageInputSize,
+                              1);
+
+        case PIXFORMAT_JPEG: {
+            camera_fb_t jpegFrame = {};
+            jpegFrame.buf = (uint8_t*)snapshot.data;
+            jpegFrame.len = snapshot.len;
+            jpegFrame.width = snapshot.width;
+            jpegFrame.height = snapshot.height;
+            jpegFrame.format = PIXFORMAT_JPEG;
+
+            uint8_t* decodedRgb565 = allocatingDecodeCameraJpeg(&jpegFrame,
+                                                                 MALLOC_CAP_SPIRAM,
+                                                                 JPEG_IMAGE_FORMAT_RGB565,
+                                                                 JPEG_IMAGE_SCALE_0);
+            if (!decodedRgb565) {
+                ESP_LOGE(CAPTURE_TAG, "JPEG decode failed");
+                return false;
+            }
+
+            convertRgb565ToGrayscale((const uint16_t*)decodedRgb565,
+                                     grayscaleWorkspace,
+                                     snapshot.width,
+                                     snapshot.height);
+            const bool ok = cropCenter(grayscaleWorkspace,
+                                       snapshot.width,
+                                       snapshot.height,
+                                       gray96Buffer,
+                                       tfImageInputSize,
+                                       tfImageInputSize,
+                                       1);
+            heap_caps_free(decodedRgb565);
+            return ok;
+        }
+
+        default:
+            ESP_LOGW(CAPTURE_TAG, "Unsupported pixel format %d", snapshot.format);
+            return false;
     }
 }
 
