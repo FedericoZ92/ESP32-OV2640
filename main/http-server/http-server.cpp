@@ -1,12 +1,14 @@
 #include "http-server/http-server.h"
 #include "define.h"
 #include "app-globals.h"
+#include "http-server/http-frame-buffer.h"
 #include "data-types/frame-mailbox.h"
 #include "data-types/frame-snapshot.h"
 #include <netinet/in.h>  // For ntohs, htons, sockaddr_in
 #include <arpa/inet.h>   // For inet_ntoa, inet_aton
 #include "image-editing/editing.h"
 #include "http-server/udp-fram-header.h"
+#include <sys/socket.h>
 
 CameraHttpServer::CaptureCallback CameraHttpServer::s_captureCallback = nullptr;
 CameraHttpServer::StreamCallback CameraHttpServer::s_streamCallback = nullptr;
@@ -360,6 +362,16 @@ esp_err_t CameraHttpServer::handleCapture(httpd_req_t *req)
 #pragma region HTTP_STREAM_TASK
 void CameraHttpServer::http_stream_publish_task(void *arg)
 {
+  AppTaskContext* ctx = static_cast<AppTaskContext*>(arg);
+  if (!ctx || !ctx->httpFrameBuffer || !ctx->streamMailboxManager) {
+    ESP_LOGE("HTTP_STREAM", "Invalid app task context for stream publish task");
+    vTaskDelete(NULL);
+    return;
+  }
+
+  HttpFrameBuffer* frameBuffer = ctx->httpFrameBuffer;
+  FrameMailboxManager* streamManager = ctx->streamMailboxManager;
+
     ESP_LOGI("HTTP_STREAM", "Stream publish task started");
 
     uint8_t* grayscaleWorkspace = (uint8_t*)heap_caps_malloc(kAcquiredFrameMaxPixels, MALLOC_CAP_8BIT);
@@ -378,7 +390,7 @@ void CameraHttpServer::http_stream_publish_task(void *arg)
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
 
         FrameSnapshot snapshot = {};
-        bool snapshotResult = streamMailboxManager.snapshot(&snapshot);
+      bool snapshotResult = streamManager->snapshot(&snapshot);
         if (!snapshotResult || snapshot.seq == lastSeenSeq) {
             continue;
         }
@@ -412,9 +424,9 @@ void CameraHttpServer::http_stream_publish_task(void *arg)
                 if (buildGray96Frame(snapshot,
                                      grayscaleWorkspace,
                                      kAcquiredFrameMaxPixels,
-                                     kAcquiredFrameMaxPixels,
                                      gray96Buffer,
                                      TF_IMAGE_INPUT_SIZE)) {
+                publishSrc = gray96Buffer;
                     publishLen = TF_IMAGE_INPUT_SIZE * TF_IMAGE_INPUT_SIZE;
                     publishWidth = TF_IMAGE_INPUT_SIZE;
                     publishHeight = TF_IMAGE_INPUT_SIZE;
@@ -429,12 +441,12 @@ void CameraHttpServer::http_stream_publish_task(void *arg)
         }
 
         const int64_t publishUs = esp_timer_get_time();
-        httpFrameBuffer.publishHttpFrame(publishSrc,
-                                        publishLen,
-                                        publishWidth,
-                                        publishHeight,
-                                        publishFormat,
-                                        publishUs);
+  frameBuffer->publishHttpFrame(publishSrc,
+              publishLen,
+              publishWidth,
+              publishHeight,
+              publishFormat,
+              publishUs);
 
         lastSeenSeq = snapshot.seq;
         publishedFrames++;
@@ -445,7 +457,7 @@ void CameraHttpServer::http_stream_publish_task(void *arg)
             ESP_LOGI("HTTP_STREAM",
                      "Publish FPS: %.2f | seq=%lu | frame=%dx%d fmt=%d len=%d",
                      publishFps,
-                     (unsigned long)httpFrameBuffer.getActiveHttpFrameSeq(),
+                     (unsigned long)frameBuffer->getActiveHttpFrameSeq(),
                      publishWidth,
                      publishHeight,
                      publishFormat,
@@ -459,6 +471,16 @@ void CameraHttpServer::http_stream_publish_task(void *arg)
 #pragma region UDP_STREAM_TASK
 void CameraHttpServer::udp_stream_task(void *arg)
 {
+  AppTaskContext* ctx = static_cast<AppTaskContext*>(arg);
+  if (!ctx || !ctx->httpFrameBuffer) {
+    ESP_LOGE("UDP_STREAM", "Invalid app task context for UDP stream task");
+    vTaskDelete(NULL);
+    return;
+  }
+
+  HttpFrameBuffer* frameBuffer = ctx->httpFrameBuffer;
+  portMUX_TYPE* frameMetaLock = ctx->httpFrameMetaLock;
+
     const uint32_t kMagic = 0x47504455U; // 'UDPG'
     const int kMaxPayload = UDP_STREAM_MAX_PAYLOAD;
     const int kPort = UDP_STREAM_PORT;
@@ -533,14 +555,22 @@ void CameraHttpServer::udp_stream_task(void *arg)
         uint8_t frameIndex = 0;
         uint32_t frameSeq = 0;
         int64_t framePublishUs = 0;
-        taskENTER_CRITICAL(&httpFrameMetaLock);
-        frameLen = activeHttpFrameLen;
-        frameIndex = activeHttpFrameIndex;
-        frameSeq = activeHttpFrameSeq;
-        framePublishUs = activeHttpFramePublishUs;
-        taskEXIT_CRITICAL(&httpFrameMetaLock);
+        if (frameMetaLock) {
+          taskENTER_CRITICAL(frameMetaLock);
+          frameLen = frameBuffer->getActiveHttpFrameLength();
+          frameIndex = frameBuffer->getActiveHttpFrameIndex();
+          frameSeq = frameBuffer->getActiveHttpFrameSeq();
+          framePublishUs = frameBuffer->getActiveHttpFramePublishUs();
+          taskEXIT_CRITICAL(frameMetaLock);
+        } else {
+          frameLen = frameBuffer->getActiveHttpFrameLength();
+          frameIndex = frameBuffer->getActiveHttpFrameIndex();
+          frameSeq = frameBuffer->getActiveHttpFrameSeq();
+          framePublishUs = frameBuffer->getActiveHttpFramePublishUs();
+        }
 
-        if (frameLen == 0 || !httpFrameBuffers[frameIndex]) {
+        const uint8_t* activeBuffer = frameBuffer->getBuffer(frameIndex);
+        if (frameLen == 0 || !activeBuffer) {
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
@@ -554,7 +584,7 @@ void CameraHttpServer::udp_stream_task(void *arg)
             continue;
         }
 
-        memcpy(frameSnapshot, httpFrameBuffers[frameIndex], frameLen);
+        memcpy(frameSnapshot, activeBuffer, frameLen);
 
         const uint16_t chunkCount = (uint16_t)((frameLen + kMaxPayload - 1) / kMaxPayload);
         const int64_t nowUs = esp_timer_get_time();

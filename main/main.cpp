@@ -64,7 +64,7 @@ HttpFrameBuffer httpFrameBuffer(kPublishedFrameMaxBytes);
 
 volatile bool pauseCameraAcquisition = false;
 
-static portMUX_TYPE httpFrameMetaLock = portMUX_INITIALIZER_UNLOCKED;
+portMUX_TYPE httpFrameMetaLock = portMUX_INITIALIZER_UNLOCKED;
 
 
 FrameMailbox inferenceMailbox;
@@ -423,7 +423,7 @@ esp_err_t streamRgbTcpCallback(httpd_req_t *req)
         if (res != ESP_OK) break;
 
         // Send binary frame buffer payload
-        res = httpd_resp_send_chunk(req, (const char*)sendPtr, frameLen);
+        res = httpd_resp_send_chunk(req, (const char*)sendPtr, frameLength);
         if (res != ESP_OK) break;
 
         // Terminate part with a carriage return line feed
@@ -535,6 +535,13 @@ extern "C" void app_main(void)
         return;
     }
 
+    static AppTaskContext appTaskContext = {};
+    appTaskContext.server = &server;
+    appTaskContext.httpFrameBuffer = &httpFrameBuffer;
+    appTaskContext.streamMailboxManager = &streamMailboxManager;
+    appTaskContext.inferenceMailboxManager = &inferenceMailboxManager;
+    appTaskContext.httpFrameMetaLock = &httpFrameMetaLock;
+
     #if ENABLE_RGB_STREAM_TASK
         if (!streamMailboxManager.initFrameMailbox("stream", MALLOC_CAP_SPIRAM)) {
             return;
@@ -579,15 +586,15 @@ extern "C" void app_main(void)
     #if USE_UDP
         ESP_LOGI(OV2640_TAG, "UDP mode active. Stream port: %d", UDP_STREAM_PORT);
         xTaskCreatePinnedToCore(
-            [&server](void* arg) { 
-                CameraHttpServer* serverPtr = static_cast<CameraHttpServer*>(arg);
-                if (serverPtr) {
-                    serverPtr->udp_stream_task(arg);
+            [](void* arg) {
+                AppTaskContext* ctx = static_cast<AppTaskContext*>(arg);
+                if (ctx && ctx->server) {
+                    ctx->server->udp_stream_task(arg);
                 }
             },
             "udp_stream_task",
             6144,
-            &server,
+            &appTaskContext,
             5,
             NULL,
             0
@@ -596,15 +603,15 @@ extern "C" void app_main(void)
 
     #if ENABLE_RGB_STREAM_TASK
         xTaskCreatePinnedToCore(
-            [&server](void* arg) { 
-                CameraHttpServer* serverPtr = static_cast<CameraHttpServer*>(arg);
-                if (serverPtr) {
-                    serverPtr->http_stream_publish_task(arg);
+            [](void* arg) {
+                AppTaskContext* ctx = static_cast<AppTaskContext*>(arg);
+                if (ctx && ctx->server) {
+                    ctx->server->http_stream_publish_task(arg);
                 }
             },
             "http_stream_publish_task",
             6144,
-            &server,
+            &appTaskContext,
             5,
             &streamMailbox.consumerTaskHandle,
             tskNO_AFFINITY
@@ -616,10 +623,10 @@ extern "C" void app_main(void)
 
     #if ENABLE_INFERENCE
         xTaskCreatePinnedToCore(
-            [&tf_wrapper](void* arg) { 
-                TfLiteWrapper* wrapperPtr = static_cast<TfLiteWrapper*>(arg); 
-                if(wrapperPtr) {
-                    tf_wrapper.inference_task(wrapperPtr);
+            [](void* arg) {
+                TfLiteWrapper* wrapperPtr = static_cast<TfLiteWrapper*>(arg);
+                if (wrapperPtr) {
+                    wrapperPtr->inference_task(arg);
                 }
             },
             "inference_task",

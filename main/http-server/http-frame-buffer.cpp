@@ -2,9 +2,14 @@
 #include "http-server/http-frame-buffer.h"
 #include "app-globals.h"
 #include "define.h"
+#include "debug.h"
 #include <stdint.h>
+#include <cstring>
 
-HttpFrameBuffer::HttpFrameBuffer(size_t publishedFrameMaxBytes) : publishedFrameMaxBytes_(publishedFrameMaxBytes) {}
+HttpFrameBuffer::HttpFrameBuffer(size_t publishedFrameMaxBytes) : 
+    publishedFrameMaxBytes_(publishedFrameMaxBytes) 
+{
+}
 
 bool HttpFrameBuffer::initPublishedHttpFrameStore(size_t publishedFrameMaxBytes, uint32_t mallocCapSpiram)
 {

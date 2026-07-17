@@ -118,8 +118,7 @@ void CameraDriver::capture_task(void *arg)
         const int64_t captureUs = esp_timer_get_time();
 
         #if ENABLE_RGB_STREAM_TASK
-            streamMailboxManager.publish(  
-                                kPublishedFrameMaxBytes,
+            streamMailboxManager.publish(
                                 frameBuffer->buf,
                                 frameBuffer->len,
                                 frameBuffer->width,
@@ -129,7 +128,6 @@ void CameraDriver::capture_task(void *arg)
         #endif
         #if ENABLE_INFERENCE
             inferenceMailboxManager.publish(
-                                kPublishedFrameMaxBytes,
                                 frameBuffer->buf,
                                 frameBuffer->len,
                                 frameBuffer->width,

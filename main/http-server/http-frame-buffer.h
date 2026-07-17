@@ -1,7 +1,9 @@
 #pragma once
 
-#include <stdint.h>
 #include "define.h"
+#include <stdint.h>
+#include <sensor.h>
+#include <cstddef>
 
 #define FRAME_BUFFERS 2
 
@@ -9,7 +11,6 @@ class HttpFrameBuffer
 {
 public:
     HttpFrameBuffer(size_t publishedFrameMaxBytes);
-
 
     bool initPublishedHttpFrameStore(size_t publishedFrameMaxBytes, uint32_t mallocCapSpiram); //MALLOC_CAP_SPIRAM
 

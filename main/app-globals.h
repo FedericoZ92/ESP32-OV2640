@@ -2,6 +2,8 @@
 
 #include "define.h"
 
+#include <freertos/FreeRTOS.h>
+
 #include "led/rgb-led.h"
 #include "led/red-led.h"
 
@@ -12,6 +14,19 @@ extern RgbLedController rgb;
 extern RedLedController redLed;
 
 extern volatile bool pauseCameraAcquisition;
+extern portMUX_TYPE httpFrameMetaLock;
+
+class CameraHttpServer;
+class HttpFrameBuffer;
+class FrameMailboxManager;
+
+struct AppTaskContext {
+    CameraHttpServer* server = nullptr;
+    HttpFrameBuffer* httpFrameBuffer = nullptr;
+    FrameMailboxManager* streamMailboxManager = nullptr;
+    FrameMailboxManager* inferenceMailboxManager = nullptr;
+    portMUX_TYPE* httpFrameMetaLock = nullptr;
+};
 
 // A
 extern CheckpointTimer jpegTimer;
