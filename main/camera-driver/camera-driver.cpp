@@ -5,7 +5,10 @@
 #include "debug.h"
 #include "app-globals.h"
 #include "data-types/frame-mailbox.h"
+#include "gpio-config.h"
+#include <driver/gpio.h>
 #include <esp_timer.h>
+
 
 #define PWDN_GPIO_NUM     -1   // Power down not used
 #define RESET_GPIO_NUM    -1   // Reset not used
@@ -23,6 +26,7 @@
 #define VSYNC_GPIO_NUM     6
 #define HREF_GPIO_NUM      7
 #define PCLK_GPIO_NUM     13
+
 // Sync signals
 
 CameraDriver::CameraDriver() {
@@ -174,16 +178,19 @@ void CameraDriver::capture_task(void *arg)
 
 void CameraDriver::operateCameraResetSequence()
 {
+    /*
     gpio_reset_pin((gpio_num_t)PWDN_GPIO_NUM);
-    gpio_reset_pin((gpio_num_t)RESET_GPIO_NUM);
     gpio_set_direction((gpio_num_t)PWDN_GPIO_NUM, GPIO_MODE_OUTPUT);
-    gpio_set_direction((gpio_num_t)RESET_GPIO_NUM, GPIO_MODE_OUTPUT);
-
     gpio_set_level((gpio_num_t)PWDN_GPIO_NUM, 0);  // Power on
-    gpio_set_level((gpio_num_t)RESET_GPIO_NUM, 0); // Hold reset
-    vTaskDelay(pdMS_TO_TICKS(10));
-    gpio_set_level((gpio_num_t)RESET_GPIO_NUM, 1); // Release reset
 
+    gpio_reset_pin((gpio_num_t)RESET_GPIO_NUM);
+    gpio_set_direction((gpio_num_t)RESET_GPIO_NUM, GPIO_MODE_OUTPUT);
+    gpio_set_level((gpio_num_t)RESET_GPIO_NUM, 0); // Hold reset
+    
+    vTaskDelay(pdMS_TO_TICKS(10));
+    
+    gpio_set_level((gpio_num_t)RESET_GPIO_NUM, 1); // Release reset
+    */
 }
 
 

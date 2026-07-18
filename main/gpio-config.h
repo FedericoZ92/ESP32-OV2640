@@ -11,7 +11,11 @@ extern "C" {
 #elif defined CONFIG_IDF_TARGET_ESP32S2
 #define BOARD_CAMERA_MODEL_ESP32S2 1
 #elif defined CONFIG_IDF_TARGET_ESP32S3
-#define BOARD_CAMERA_MODEL_ESP32_S3_EYE 1
+// Default this project to ESP32-S3 N16R8-CAM wiring.
+// Override by defining BOARD_CAMERA_MODEL_ESP32_S3_EYE as needed.
+#if !defined(BOARD_CAMERA_MODEL_ESP32_S3_EYE)
+#define BOARD_CAMERA_MODEL_ESP32_S3_N16R8 1
+#endif
 #endif
 
 #define portTICK_RATE_MS              portTICK_PERIOD_MS
@@ -101,6 +105,28 @@ extern "C" {
 #define Y4_GPIO_NUM       10
 #define Y3_GPIO_NUM       9
 #define Y2_GPIO_NUM       8
+
+#elif BOARD_CAMERA_MODEL_ESP32_S3_N16R8
+
+#define PWDN_GPIO_NUM     -1
+#define RESET_GPIO_NUM    -1
+
+#define VSYNC_GPIO_NUM    6
+#define HREF_GPIO_NUM     7
+#define PCLK_GPIO_NUM     13
+#define XCLK_GPIO_NUM     15
+
+#define SIOD_GPIO_NUM     4
+#define SIOC_GPIO_NUM     5
+
+#define Y9_GPIO_NUM       16
+#define Y8_GPIO_NUM       17
+#define Y7_GPIO_NUM       18
+#define Y6_GPIO_NUM       12
+#define Y5_GPIO_NUM       10
+#define Y4_GPIO_NUM       8
+#define Y3_GPIO_NUM       9
+#define Y2_GPIO_NUM       11
 
 #endif
 

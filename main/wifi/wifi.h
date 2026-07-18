@@ -31,12 +31,14 @@ private:
                              int32_t event_id, void *event_data);
     static const char *disconnectReasonToString(uint8_t reason);
     static void applyLegacySecurityFallback();
+    static void logNearbyAccessPoints();
 
     static bool s_connected;
     static bool s_connectFailed;
     static bool s_stoppingSta;
     static uint8_t s_lastDisconnectReason;
     static bool s_legacySecurityFallbackApplied;
+    static bool s_loggedNearbyAccessPoints;
     static int s_retryCount;
     static int s_maxRetry;
 };

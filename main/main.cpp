@@ -76,6 +76,9 @@ FrameMailboxManager streamMailboxManager(&streamMailbox, kPublishedFrameMaxBytes
 extern "C" void app_main(void)
 {
     esp_log_level_set("*", ESP_LOG_WARN);
+    esp_log_level_set(OV2640_TAG, ESP_LOG_INFO);
+    esp_log_level_set("WifiManager", ESP_LOG_INFO);
+    esp_log_level_set("CameraHttpServer", ESP_LOG_INFO);
 
     // --- Print chip info ---
     esp_chip_info_t chip_info;
@@ -106,7 +109,8 @@ extern "C" void app_main(void)
         ESP_LOGE(OV2640_TAG, "Wi-Fi base init failed: %s", esp_err_to_name(wifiInitErr));
         return;
     }
-    //STA: station. Wi-Fi STA is a device that connects to a Wi-Fi access point. 
+    // STA: station. Wi-Fi STA is a device that connects to a Wi-Fi access point. 
+    // Opposed to AP: access point. Wi-Fi AP is a device that provides a Wi-Fi network for other devices to connect to.
     esp_err_t wifiStaErr = wifi.initSTA(WIFI_NETWORK, WIFI_PASSWORD); // connect to your network
     if (wifiStaErr != ESP_OK) {
         ESP_LOGE(OV2640_TAG, "Wi-Fi STA connection failed, capture/HTTP startup aborted");
@@ -114,7 +118,7 @@ extern "C" void app_main(void)
     }
 
     // --- Camera initialization ---
-    CameraDriver camera;
+    static CameraDriver camera;
     if (camera.init() != ESP_OK) {
         ESP_LOGE(OV2640_TAG, "Camera initialization failed");
         return;

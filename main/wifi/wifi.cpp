@@ -10,6 +10,7 @@ bool WifiManager::s_connectFailed = false;
 bool WifiManager::s_stoppingSta = false;
 uint8_t WifiManager::s_lastDisconnectReason = WIFI_REASON_UNSPECIFIED;
 bool WifiManager::s_legacySecurityFallbackApplied = false;
+bool WifiManager::s_loggedNearbyAccessPoints = false;
 int WifiManager::s_retryCount = 0;
 int WifiManager::s_maxRetry = 5;
 
@@ -83,8 +84,11 @@ esp_err_t WifiManager::initSTA(const std::string &ssid, const std::string &passw
     wifi_config_t sta_config = {};
     strncpy((char *)sta_config.sta.ssid, ssid.c_str(), sizeof(sta_config.sta.ssid));
     strncpy((char *)sta_config.sta.password, password.c_str(), sizeof(sta_config.sta.password));
-    // Improve compatibility with mixed WPA2/WPA3 home routers.
-    sta_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    // Use full-channel scan and permissive thresholds to avoid false NO_AP_FOUND filtering.
+    sta_config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    sta_config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+    sta_config.sta.threshold.rssi = -127;
+    sta_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
     sta_config.sta.pmf_cfg.capable = true;
     sta_config.sta.pmf_cfg.required = false;
 
@@ -99,10 +103,19 @@ esp_err_t WifiManager::initSTA(const std::string &ssid, const std::string &passw
     s_stoppingSta = false;
     s_lastDisconnectReason = WIFI_REASON_UNSPECIFIED;
     s_legacySecurityFallbackApplied = false;
+    s_loggedNearbyAccessPoints = false;
     s_retryCount = 0;
     s_maxRetry = (max_retry > 0) ? max_retry : 1;
     ESP_LOGI(TAG, "Connecting to SSID '%s' (password len=%u, max retry=%d)",
              ssid.c_str(), (unsigned)password.length(), s_maxRetry);
+    ESP_LOGI(TAG,
+             "STA cfg: scan=%s sort=%s min_rssi=%d min_auth=%d pmf(capable=%d required=%d)",
+             (sta_config.sta.scan_method == WIFI_ALL_CHANNEL_SCAN) ? "all" : "fast",
+             (sta_config.sta.sort_method == WIFI_CONNECT_AP_BY_SIGNAL) ? "signal" : "security",
+             (int)sta_config.sta.threshold.rssi,
+             (int)sta_config.sta.threshold.authmode,
+             (int)sta_config.sta.pmf_cfg.capable,
+             (int)sta_config.sta.pmf_cfg.required);
 
     // Wait until connected or terminal failure is reported by event handler.
     while (!s_connected && !s_connectFailed) {
@@ -148,6 +161,57 @@ void WifiManager::applyLegacySecurityFallback()
     s_legacySecurityFallbackApplied = true;
     ESP_LOGW(TAG,
              "Applied legacy STA security fallback (WPA/WPA2 + PMF disabled) after handshake timeout.");
+}
+
+void WifiManager::logNearbyAccessPoints()
+{
+    wifi_scan_config_t scan_cfg = {};
+    scan_cfg.show_hidden = true;
+
+    esp_err_t scan_err = esp_wifi_scan_start(&scan_cfg, true);
+    if (scan_err != ESP_OK) {
+        ESP_LOGW(TAG, "AP scan failed while diagnosing NO_AP_FOUND: %s", esp_err_to_name(scan_err));
+        return;
+    }
+
+    uint16_t apCount = 0;
+    esp_err_t num_err = esp_wifi_scan_get_ap_num(&apCount);
+    if (num_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to read AP scan count: %s", esp_err_to_name(num_err));
+        return;
+    }
+
+    if (apCount == 0) {
+        ESP_LOGW(TAG, "AP scan completed: no 2.4GHz APs visible");
+        return;
+    }
+
+    uint16_t toLog = (apCount > 10) ? 10 : apCount;
+    wifi_ap_record_t *records = static_cast<wifi_ap_record_t *>(calloc(toLog, sizeof(wifi_ap_record_t)));
+    if (!records) {
+        ESP_LOGW(TAG, "Out of memory while storing AP scan results");
+        return;
+    }
+
+    esp_err_t rec_err = esp_wifi_scan_get_ap_records(&toLog, records);
+    if (rec_err != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to read AP scan records: %s", esp_err_to_name(rec_err));
+        free(records);
+        return;
+    }
+
+    ESP_LOGW(TAG, "Nearby APs (%u total, showing %u):", (unsigned)apCount, (unsigned)toLog);
+    for (uint16_t i = 0; i < toLog; ++i) {
+        ESP_LOGW(TAG,
+                 "  %u) SSID='%s' RSSI=%d ch=%u auth=%d",
+                 (unsigned)(i + 1),
+                 reinterpret_cast<const char *>(records[i].ssid),
+                 (int)records[i].rssi,
+                 (unsigned)records[i].primary,
+                 (int)records[i].authmode);
+    }
+
+    free(records);
 }
 
 const char *WifiManager::disconnectReasonToString(uint8_t reason)
@@ -242,6 +306,13 @@ void WifiManager::eventHandler(void *arg, esp_event_base_t event_base,
         if (s_retryCount < s_maxRetry) {
             if (reason == WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT && !s_legacySecurityFallbackApplied) {
                 applyLegacySecurityFallback();
+            }
+            if (reason == WIFI_REASON_NO_AP_FOUND && !s_loggedNearbyAccessPoints) {
+                ESP_LOGW(TAG,
+                         "NO_AP_FOUND: verify SSID spelling and ensure router exposes a 2.4GHz network. "
+                         "ESP32 cannot connect to 5GHz-only SSIDs.");
+                logNearbyAccessPoints();
+                s_loggedNearbyAccessPoints = true;
             }
             esp_wifi_connect();
             s_retryCount++;
