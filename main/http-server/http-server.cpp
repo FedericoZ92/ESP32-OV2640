@@ -1,5 +1,6 @@
 #include "http-server/http-server.h"
 #include "define.h"
+#include "debug.h"
 #include "app-globals.h"
 #include "http-server/http-frame-buffer.h"
 #include "data-types/frame-mailbox.h"
@@ -16,6 +17,377 @@ CameraHttpServer::StreamCallback CameraHttpServer::s_streamCallback = nullptr;
 CameraHttpServer::CameraHttpServer() = default;
 CameraHttpServer::~CameraHttpServer() { stop(); }
 
+
+#pragma region HTTP_CAPTURE_CALLBACK
+// HTTP handler, returns the latest captured frame payload, uses httpd_resp_send (HTTP over TCP)
+esp_err_t CameraHttpServer::captureRgbTcpCallback(httpd_req_t *req, HttpFrameBuffer* frameBuffer, portMUX_TYPE* frameMetaLock)
+{
+    const int64_t reqStartUs = esp_timer_get_time();
+    static int64_t httpReqWindowStartUs = 0;
+    static uint32_t httpReqWindowCount = 0;
+    static uint32_t httpReqWindowStale = 0;
+    static uint32_t httpReqWindowAdvanceEvents = 0;
+    static uint32_t httpReqWindowAdvancedFrames = 0;
+    static uint32_t httpReqWindowMaxAdvance = 0;
+    static uint32_t httpReqWindowDroppedEstimate = 0;
+    static uint32_t httpReqWindowMaxDroppedBurst = 0;
+    static uint32_t httpReqWindowLastSeq = 0;
+
+    // Optional debug toggle: /capture.rgb?freeze=1 or /capture.rgb?freeze=0
+    char query[64] = {0};
+    const size_t queryLen = httpd_req_get_url_query_len(req);
+    if (queryLen > 0 && queryLen < sizeof(query)) {
+        if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+            char freezeVal[8] = {0};
+            if (httpd_query_key_value(query, "freeze", freezeVal, sizeof(freezeVal)) == ESP_OK) {
+                const bool newPauseState = (strcmp(freezeVal, "1") == 0 || strcmp(freezeVal, "true") == 0);
+                static bool lastLoggedPauseState = false;
+                pauseCameraAcquisition = newPauseState;
+                if (newPauseState != lastLoggedPauseState) {
+                    ESP_LOGW(CAPTURE_TAG, "Capture freeze mode: %s", newPauseState ? "ON" : "OFF");
+                    lastLoggedPauseState = newPauseState;
+                }
+            }
+        }
+    }
+
+    httpd_resp_set_type(req, "application/octet-stream");
+
+    size_t frameLength = 0;
+    uint8_t frameIndex = 0;
+    uint16_t frameWidth = TF_IMAGE_INPUT_SIZE;
+    uint16_t frameHeight = TF_IMAGE_INPUT_SIZE;
+    pixformat_t frameFormat = PIXFORMAT_GRAYSCALE;
+    uint32_t frameSeq = 0;
+    int64_t framePublishUs = 0;
+    taskENTER_CRITICAL(frameMetaLock);
+    frameLength = frameBuffer->getActiveHttpFrameLength();
+    frameIndex = frameBuffer->getActiveHttpFrameIndex();
+    frameWidth = frameBuffer->getActiveHttpFrameWidth();
+    frameHeight = frameBuffer->getActiveHttpFrameHeight();
+    frameFormat = frameBuffer->getActiveHttpFrameFormat();
+    frameSeq = frameBuffer->getActiveHttpFrameSeq();
+    framePublishUs = frameBuffer->getActiveHttpFramePublishUs();
+    taskEXIT_CRITICAL(frameMetaLock);
+
+    if (frameFormat == PIXFORMAT_JPEG) {
+        httpd_resp_set_type(req, "image/jpeg");
+    } else {
+        httpd_resp_set_type(req, "application/octet-stream");
+    }
+
+    // Expose frame telemetry in HTTP headers for browser-side diagnostics.
+    char seqBuf[16];
+    snprintf(seqBuf, sizeof(seqBuf), "%lu", (unsigned long)frameSeq);
+    httpd_resp_set_hdr(req, "X-Frame-Seq", seqBuf);
+
+    const int64_t nowUs = esp_timer_get_time();
+    const int64_t ageUs = (framePublishUs > 0 && nowUs > framePublishUs) ? (nowUs - framePublishUs) : 0;
+    char ageBuf[24];
+    snprintf(ageBuf, sizeof(ageBuf), "%lld", (long long)(ageUs / 1000));
+    httpd_resp_set_hdr(req, "X-Frame-Age-Ms", ageBuf);
+
+    char lenBuf[16];
+    snprintf(lenBuf, sizeof(lenBuf), "%u", (unsigned int)frameLength);
+    httpd_resp_set_hdr(req, "X-Frame-Len", lenBuf);
+
+    char widthBuf[8];
+    snprintf(widthBuf, sizeof(widthBuf), "%u", (unsigned int)frameWidth);
+    httpd_resp_set_hdr(req, "X-Frame-Width", widthBuf);
+
+    char heightBuf[8];
+    snprintf(heightBuf, sizeof(heightBuf), "%u", (unsigned int)frameHeight);
+    httpd_resp_set_hdr(req, "X-Frame-Height", heightBuf);
+
+    httpd_resp_set_hdr(req, "X-Frame-Format", (frameFormat == PIXFORMAT_JPEG) ? "jpeg" : "gray8");
+
+    if (httpReqWindowStartUs == 0) {
+        httpReqWindowStartUs = nowUs;
+    }
+
+    httpReqWindowCount++;
+    if (frameSeq == httpReqWindowLastSeq && frameSeq != 0) {
+        httpReqWindowStale++;
+    } else if (httpReqWindowLastSeq != 0 && frameSeq > httpReqWindowLastSeq) {
+        const uint32_t advancedBy = frameSeq - httpReqWindowLastSeq;
+        httpReqWindowAdvanceEvents++;
+        httpReqWindowAdvancedFrames += advancedBy;
+        if (advancedBy > 1) {
+            const uint32_t dropped = advancedBy - 1;
+            httpReqWindowDroppedEstimate += dropped;
+            if (dropped > httpReqWindowMaxDroppedBurst) {
+                httpReqWindowMaxDroppedBurst = dropped;
+            }
+        }
+        if (advancedBy > httpReqWindowMaxAdvance) {
+            httpReqWindowMaxAdvance = advancedBy;
+        }
+    }
+    httpReqWindowLastSeq = frameSeq;
+
+    const uint8_t *sendPtr = nullptr;
+    size_t sendLength = frameLength;
+    if (frameLength > 0 && frameBuffer->isBuffersInitialized(frameIndex)) {
+        sendPtr = frameBuffer->getBuffer(frameIndex);
+    } else {
+        // Send a blank frame until the first capture is published.
+        static uint8_t blank[kPublishedFrameMaxBytes] = {0};
+        sendPtr = blank;
+        sendLength = sizeof(blank);
+    }
+
+    const int64_t sendStartUs = esp_timer_get_time();
+    esp_err_t sendErr = httpd_resp_send(req, (const char*)sendPtr, sendLength);
+    const int64_t sendEndUs = esp_timer_get_time();
+    const int64_t sendUs = (sendEndUs > sendStartUs) ? (sendEndUs - sendStartUs) : 0;
+    const int64_t reqTotalUs = (sendEndUs > reqStartUs) ? (sendEndUs - reqStartUs) : 0;
+
+    static uint32_t txWindowCount = 0;
+    static uint32_t txWindowErrCount = 0;
+    static int64_t txWindowStartUs = 0;
+    static int64_t txWindowSendSumUs = 0;
+    static int64_t txWindowReqSumUs = 0;
+    static int64_t txWindowSendMaxUs = 0;
+    if (txWindowStartUs == 0) {
+        txWindowStartUs = sendEndUs;
+    }
+
+    txWindowCount++;
+    txWindowSendSumUs += sendUs;
+    txWindowReqSumUs += reqTotalUs;
+    if (sendUs > txWindowSendMaxUs) {
+        txWindowSendMaxUs = sendUs;
+    }
+    if (sendErr != ESP_OK) {
+        txWindowErrCount++;
+        static int64_t lastSendErrLogUs = 0;
+        const int64_t nowErrUs = sendEndUs;
+        if (nowErrUs - lastSendErrLogUs >= 1000000) {
+            ESP_LOGW("HTTP_TX", "httpd_resp_send failed: %s", esp_err_to_name(sendErr));
+            lastSendErrLogUs = nowErrUs;
+        }
+    }
+
+    const int64_t txElapsedUs = sendEndUs - txWindowStartUs;
+    if (txElapsedUs >= 2000000) {
+        const float avgSendMs = (float)txWindowSendSumUs / (1000.0f * (float)txWindowCount);
+        const float avgReqMs = (float)txWindowReqSumUs / (1000.0f * (float)txWindowCount);
+        const float maxSendMs = (float)txWindowSendMaxUs / 1000.0f;
+        ESP_LOGI("HTTP_TX", "avg_send_ms=%.2f | max_send_ms=%.2f | avg_req_ms=%.2f | err=%lu/%lu | len=%u | seq=%lu",
+                 avgSendMs,
+                 maxSendMs,
+                 avgReqMs,
+                 (unsigned long)txWindowErrCount,
+                 (unsigned long)txWindowCount,
+                 (unsigned int)sendLength,
+                 (unsigned long)frameSeq);
+        txWindowCount = 0;
+        txWindowErrCount = 0;
+        txWindowSendSumUs = 0;
+        txWindowReqSumUs = 0;
+        txWindowSendMaxUs = 0;
+        txWindowStartUs = sendEndUs;
+    }
+
+    const int64_t httpReqElapsedUs = sendEndUs - httpReqWindowStartUs;
+    if (httpReqElapsedUs >= 2000000) {
+        const float reqFps = (httpReqWindowCount * 1000000.0f) / (float)httpReqElapsedUs;
+        const float avgAdvance = (httpReqWindowAdvanceEvents > 0)
+            ? ((float)httpReqWindowAdvancedFrames / (float)httpReqWindowAdvanceEvents)
+            : 0.0f;
+        const float droppedPerSec = (httpReqWindowDroppedEstimate * 1000000.0f) / (float)httpReqElapsedUs;
+        const float droppedPerReq = (httpReqWindowCount > 0)
+            ? ((float)httpReqWindowDroppedEstimate / (float)httpReqWindowCount)
+            : 0.0f;
+        ESP_LOGI("HTTP_CAPTURE",
+                 "req_fps=%.2f | stale=%lu/%lu | dropped_est=%lu | drop_per_req=%.2f | drop_per_sec=%.2f | seq=%lu | age_ms=%lld | len=%u | producer_advance_avg=%.2f | producer_advance_max=%lu",
+                 reqFps,
+                 (unsigned long)httpReqWindowStale,
+                 (unsigned long)httpReqWindowCount,
+                 (unsigned long)httpReqWindowDroppedEstimate,
+                 droppedPerReq,
+                 droppedPerSec,
+                 (unsigned long)frameSeq,
+                 (long long)(ageUs / 1000),
+                 (unsigned int)sendLength,
+                 avgAdvance,
+                 (unsigned long)httpReqWindowMaxAdvance);
+
+        if (httpReqWindowDroppedEstimate > 0) {
+            const float dropRatioPerReq = (httpReqWindowCount > 0)
+                ? ((float)httpReqWindowDroppedEstimate / (float)httpReqWindowCount)
+                : 0.0f;
+            const float dropSeverity = ((httpReqWindowDroppedEstimate + httpReqWindowCount) > 0)
+                ? ((float)httpReqWindowDroppedEstimate /
+                   (float)(httpReqWindowDroppedEstimate + httpReqWindowCount))
+                : 0.0f;
+            const bool enoughSamples = (httpReqWindowCount >= 10);
+            const bool activeClient = (reqFps >= 3.0f);
+
+            if (!enoughSamples || !activeClient) {
+                ESP_LOGW("HTTP_CAPTURE",
+                         "FRAME_DROP_STATE: low-sample/backlog window (dropped=%lu, req=%lu, req_fps=%.2f, drop_per_req=%.2f, max_burst=%lu)",
+                         (unsigned long)httpReqWindowDroppedEstimate,
+                         (unsigned long)httpReqWindowCount,
+                         reqFps,
+                         dropRatioPerReq,
+                         (unsigned long)httpReqWindowMaxDroppedBurst);
+            } else if (dropSeverity >= 0.50f || httpReqWindowMaxDroppedBurst >= 5) {
+                ESP_LOGE("HTTP_CAPTURE",
+                         "FRAME_DROP_STATE: heavy drop detected (dropped=%lu, req=%lu, severity=%.2f, drop_per_req=%.2f, max_burst=%lu)",
+                         (unsigned long)httpReqWindowDroppedEstimate,
+                         (unsigned long)httpReqWindowCount,
+                         dropSeverity,
+                         dropRatioPerReq,
+                         (unsigned long)httpReqWindowMaxDroppedBurst);
+            } else {
+                ESP_LOGW("HTTP_CAPTURE",
+                         "FRAME_DROP_STATE: drop detected (dropped=%lu, req=%lu, severity=%.2f, drop_per_req=%.2f, max_burst=%lu)",
+                         (unsigned long)httpReqWindowDroppedEstimate,
+                         (unsigned long)httpReqWindowCount,
+                         dropSeverity,
+                         dropRatioPerReq,
+                         (unsigned long)httpReqWindowMaxDroppedBurst);
+            }
+        }
+
+        if (httpReqWindowCount > 0 && httpReqWindowStale > (httpReqWindowCount / 2)) {
+            ESP_LOGW("HTTP_CAPTURE",
+                     "STALE_FRAME_STATE: over 50%% stale responses (%lu/%lu)",
+                     (unsigned long)httpReqWindowStale,
+                     (unsigned long)httpReqWindowCount);
+        }
+        httpReqWindowStartUs = sendEndUs;
+        httpReqWindowCount = 0;
+        httpReqWindowStale = 0;
+        httpReqWindowAdvanceEvents = 0;
+        httpReqWindowAdvancedFrames = 0;
+        httpReqWindowMaxAdvance = 0;
+        httpReqWindowDroppedEstimate = 0;
+        httpReqWindowMaxDroppedBurst = 0;
+    }
+
+    return sendErr;
+}
+
+#pragma region STREAM_RGB_TCP_CALLBACK
+// HTTP handler, keeps one connection open and streams frames continuously, uses httpd_resp_send_chunk (HTTP multipart over TCP)
+esp_err_t CameraHttpServer::streamRgbTcpCallback(httpd_req_t *req, HttpFrameBuffer* frameBuffer, portMUX_TYPE* frameMetaLock)
+{
+    esp_err_t res = ESP_OK;
+    char *part_buf = (char*)malloc(256);
+    if (!part_buf) {
+        ESP_LOGE("HTTP_STREAM", "Failed to allocate header buffer for streaming");
+        return ESP_ERR_NO_MEM;
+    }
+
+    #define STREAM_BOUNDARY "123456789000000000000987654321"
+    
+    // 1. Prepare initial Multipart headers
+    res = httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=" STREAM_BOUNDARY);
+    if (res != ESP_OK) { free(part_buf); return res; }
+    res = httpd_resp_set_hdr(req, "Connection", "keep-alive");
+    if (res != ESP_OK) { free(part_buf); return res; }
+    res = httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    if (res != ESP_OK) { free(part_buf); return res; }
+    res = httpd_resp_set_hdr(req, "Pragma", "no-cache");
+    if (res != ESP_OK) { free(part_buf); return res; }
+    res = httpd_resp_set_hdr(req, "Expires", "0");
+    if (res != ESP_OK) { free(part_buf); return res; }
+
+    // 2. FORCE-FLUSH HEADERS IMMEDIATELY
+    // Sending a tiny, harmless 2-byte chunk (\r\n) triggers the HTTP server 
+    // to instantly send the HTTP "200 OK" and headers to the browser.
+    // This transitions the browser UI from "Connecting..." to "Streaming active...".
+    res = httpd_resp_send_chunk(req, "\r\n", 2);
+    if (res != ESP_OK) { free(part_buf); return res; }
+
+    uint32_t lastSeenSeq = 0;
+    ESP_LOGI("HTTP_STREAM", "Started real-time multipart stream session");
+
+    // 3. Stream loop
+    while (true) {
+        size_t frameLength = 0;
+        uint8_t frameIndex = 0;
+        uint16_t frameWidth = TF_IMAGE_INPUT_SIZE;
+        uint16_t frameHeight = TF_IMAGE_INPUT_SIZE;
+        pixformat_t frameFormat = PIXFORMAT_GRAYSCALE;
+        uint32_t frameSeq = 0;
+        int64_t framePublishUs = 0;
+
+        // Check if a new frame is ready
+        taskENTER_CRITICAL(frameMetaLock);
+        frameSeq = frameBuffer->getActiveHttpFrameSeq();
+        taskEXIT_CRITICAL(frameMetaLock);
+
+        if (frameSeq == lastSeenSeq) {
+            // No new frame yet; yield to give the capture task CPU time
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+
+        // Extract metadata safely
+        taskENTER_CRITICAL(frameMetaLock);
+        frameLength = frameBuffer->getActiveHttpFrameLength();
+        frameIndex = frameBuffer->getActiveHttpFrameIndex();
+        frameWidth = frameBuffer->getActiveHttpFrameWidth();
+        frameHeight = frameBuffer->getActiveHttpFrameHeight();
+        frameFormat = frameBuffer->getActiveHttpFrameFormat();
+        framePublishUs = frameBuffer->getActiveHttpFramePublishUs();
+        taskEXIT_CRITICAL(frameMetaLock);
+
+        // Read directly from the active buffer (safe due to double-buffering architecture)
+        const uint8_t *sendPtr = frameBuffer->getBuffer(frameIndex);
+        if (!sendPtr || frameLength == 0) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+
+        const int64_t nowUs = esp_timer_get_time();
+        const int64_t ageUs = (framePublishUs > 0 && nowUs > framePublishUs) ? (nowUs - framePublishUs) : 0;
+
+        // Format multipart headers for this individual frame, including telemetry
+        int hlen = snprintf(part_buf, 256,
+            "--" STREAM_BOUNDARY "\r\n"
+            "Content-Type: %s\r\n"
+            "Content-Length: %zu\r\n"
+            "X-Frame-Seq: %lu\r\n"
+            "X-Frame-Age-Ms: %lld\r\n"
+            "X-Frame-Width: %d\r\n"
+            "X-Frame-Height: %d\r\n"
+            "X-Frame-Format: %s\r\n"
+            "\r\n",
+            (frameFormat == PIXFORMAT_JPEG) ? "image/jpeg" : "application/octet-stream",
+            (size_t)frameLength,
+            (unsigned long)frameSeq,
+            (long long)(ageUs / 1000),
+            (int)frameWidth,
+            (int)frameHeight,
+            (frameFormat == PIXFORMAT_JPEG) ? "jpeg" : "gray8"
+        );
+
+        // Send boundary and custom headers
+        res = httpd_resp_send_chunk(req, part_buf, hlen);
+        if (res != ESP_OK) break;
+
+        // Send binary frame buffer payload
+        res = httpd_resp_send_chunk(req, (const char*)sendPtr, frameLength);
+        if (res != ESP_OK) break;
+
+        // Terminate part with a carriage return line feed
+        res = httpd_resp_send_chunk(req, "\r\n", 2);
+        if (res != ESP_OK) break;
+
+        lastSeenSeq = frameSeq;
+    }
+
+    ESP_LOGI("HTTP_STREAM", "Multipart stream session ended: %s", esp_err_to_name(res));
+    free(part_buf);
+    return res;
+}
+
+
+#pragma region INDEX_HTML
 // HTML page for live view using <canvas>
 #if USE_UDP
 static const char *INDEX_HTML = R"rawliteral(
@@ -232,6 +604,7 @@ static const char *INDEX_HTML = R"rawliteral(
 )rawliteral";
 #endif
 
+#pragma region HTTP_SERVER_METHODS
 // start HTTP Server
 esp_err_t CameraHttpServer::start(uint16_t port)
 {
@@ -269,15 +642,15 @@ esp_err_t CameraHttpServer::start(uint16_t port)
 
     // --- Legacy capture path: redirect to viewer page ---
     httpd_uri_t uri_capture_jpg_legacy = {
-      .uri = "/capture.jpg",
-      .method = HTTP_GET,
-      .handler = [](httpd_req_t *req) -> esp_err_t {
-        httpd_resp_set_status(req, "302 Found");
-        httpd_resp_set_hdr(req, "Location", "/");
-        httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-        return httpd_resp_send(req, nullptr, 0);
-      },
-      .user_ctx = nullptr
+        .uri = "/capture.jpg",
+        .method = HTTP_GET,
+        .handler = [](httpd_req_t *req) -> esp_err_t {
+          httpd_resp_set_status(req, "302 Found");
+          httpd_resp_set_hdr(req, "Location", "/");
+          httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+          return httpd_resp_send(req, nullptr, 0);
+        },
+        .user_ctx = nullptr
     };
     httpd_register_uri_handler(serverHandle, &uri_capture_jpg_legacy);
 
@@ -290,7 +663,7 @@ esp_err_t CameraHttpServer::start(uint16_t port)
                 httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
                 httpd_resp_set_hdr(req, "Pragma", "no-cache");
                 httpd_resp_set_hdr(req, "Expires", "0");
-                return CameraHttpServer::s_captureCallback(req);
+                return CameraHttpServer::s_captureCallback(req, &httpFrameBuffer, &httpFrameMetaLock);
             } else {
                 httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No capture handler");
                 return ESP_FAIL;
@@ -302,20 +675,20 @@ esp_err_t CameraHttpServer::start(uint16_t port)
 
     // --- Streaming handler: serves continuous raw grayscale frames ---
     httpd_uri_t uri_stream_rgb = {
-      .uri = "/stream.rgb",
-      .method = HTTP_GET,
-      .handler = [](httpd_req_t *req) -> esp_err_t {
-        if (CameraHttpServer::s_streamCallback) {
-          httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
-          httpd_resp_set_hdr(req, "Pragma", "no-cache");
-          httpd_resp_set_hdr(req, "Expires", "0");
-          return CameraHttpServer::s_streamCallback(req);
-        }
+        .uri = "/stream.rgb",
+        .method = HTTP_GET,
+        .handler = [](httpd_req_t *req) -> esp_err_t {
+            if (CameraHttpServer::s_streamCallback) {
+              httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+              httpd_resp_set_hdr(req, "Pragma", "no-cache");
+              httpd_resp_set_hdr(req, "Expires", "0");
+                            return CameraHttpServer::s_streamCallback(req, &httpFrameBuffer, &httpFrameMetaLock);
+            }
 
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No stream handler");
-        return ESP_FAIL;
-      },
-      .user_ctx = nullptr
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No stream handler");
+            return ESP_FAIL;
+        },
+        .user_ctx = nullptr
     };
     httpd_register_uri_handler(serverHandle, &uri_stream_rgb);
 
@@ -346,31 +719,40 @@ void CameraHttpServer::setStreamHandler(StreamCallback callback)
 
 
 // generic capture handler
-esp_err_t CameraHttpServer::handleCapture(httpd_req_t *req)
+esp_err_t CameraHttpServer::handleCapture(httpd_req_t *req, HttpFrameBuffer* frameBuffer, portMUX_TYPE* frameMetaLock)
 {
     if (s_captureCallback) {
         httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
         httpd_resp_set_hdr(req, "Pragma", "no-cache");
         httpd_resp_set_hdr(req, "Expires", "0");
-        return s_captureCallback(req);
+        return s_captureCallback(req, frameBuffer, frameMetaLock);
     } else {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No capture handler");
         return ESP_FAIL;
     }
 }
 
+/*esp_err_t CameraHttpServer::handleIndex(httpd_req_t *req, HttpFrameBuffer* frameBuffer, portMUX_TYPE* frameMetaLock)
+{
+    if(s_streamCallback) ---
+      httpd_resp_set_type(req, "text/html");
+      httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+      ESP_LOGI(TAG, "Serving index page");
+      return httpd_resp_send(req, INDEX_HTML, HTTPD_RESP_USE_STRLEN);
+}*/
+
 #pragma region HTTP_STREAM_TASK
 void CameraHttpServer::http_stream_publish_task(void *arg)
 {
-  AppTaskContext* ctx = static_cast<AppTaskContext*>(arg);
-  if (!ctx || !ctx->httpFrameBuffer || !ctx->streamMailboxManager) {
-    ESP_LOGE("HTTP_STREAM", "Invalid app task context for stream publish task");
-    vTaskDelete(NULL);
-    return;
-  }
+    AppTaskContext* ctx = static_cast<AppTaskContext*>(arg);
+    if (!ctx || !ctx->httpFrameBuffer || !ctx->streamMailboxManager) {
+      ESP_LOGE("HTTP_STREAM", "Invalid app task context for stream publish task");
+      vTaskDelete(NULL);
+      return;
+    }
 
-  HttpFrameBuffer* frameBuffer = ctx->httpFrameBuffer;
-  FrameMailboxManager* streamManager = ctx->streamMailboxManager;
+    HttpFrameBuffer* frameBuffer = ctx->httpFrameBuffer;
+    FrameMailboxManager* streamManager = ctx->streamMailboxManager;
 
     ESP_LOGI("HTTP_STREAM", "Stream publish task started");
 
@@ -390,7 +772,7 @@ void CameraHttpServer::http_stream_publish_task(void *arg)
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
 
         FrameSnapshot snapshot = {};
-      bool snapshotResult = streamManager->snapshot(&snapshot);
+        bool snapshotResult = streamManager->snapshot(&snapshot);
         if (!snapshotResult || snapshot.seq == lastSeenSeq) {
             continue;
         }
@@ -441,12 +823,12 @@ void CameraHttpServer::http_stream_publish_task(void *arg)
         }
 
         const int64_t publishUs = esp_timer_get_time();
-  frameBuffer->publishHttpFrame(publishSrc,
-              publishLen,
-              publishWidth,
-              publishHeight,
-              publishFormat,
-              publishUs);
+        frameBuffer->publishHttpFrame(publishSrc,
+                                      publishLen,
+                                      publishWidth,
+                                      publishHeight,
+                                      publishFormat,
+                                      publishUs);
 
         lastSeenSeq = snapshot.seq;
         publishedFrames++;
@@ -556,17 +938,17 @@ void CameraHttpServer::udp_stream_task(void *arg)
         uint32_t frameSeq = 0;
         int64_t framePublishUs = 0;
         if (frameMetaLock) {
-          taskENTER_CRITICAL(frameMetaLock);
-          frameLen = frameBuffer->getActiveHttpFrameLength();
-          frameIndex = frameBuffer->getActiveHttpFrameIndex();
-          frameSeq = frameBuffer->getActiveHttpFrameSeq();
-          framePublishUs = frameBuffer->getActiveHttpFramePublishUs();
-          taskEXIT_CRITICAL(frameMetaLock);
+            taskENTER_CRITICAL(frameMetaLock);
+            frameLen = frameBuffer->getActiveHttpFrameLength();
+            frameIndex = frameBuffer->getActiveHttpFrameIndex();
+            frameSeq = frameBuffer->getActiveHttpFrameSeq();
+            framePublishUs = frameBuffer->getActiveHttpFramePublishUs();
+            taskEXIT_CRITICAL(frameMetaLock);
         } else {
-          frameLen = frameBuffer->getActiveHttpFrameLength();
-          frameIndex = frameBuffer->getActiveHttpFrameIndex();
-          frameSeq = frameBuffer->getActiveHttpFrameSeq();
-          framePublishUs = frameBuffer->getActiveHttpFramePublishUs();
+            frameLen = frameBuffer->getActiveHttpFrameLength();
+            frameIndex = frameBuffer->getActiveHttpFrameIndex();
+            frameSeq = frameBuffer->getActiveHttpFrameSeq();
+            framePublishUs = frameBuffer->getActiveHttpFramePublishUs();
         }
 
         const uint8_t* activeBuffer = frameBuffer->getBuffer(frameIndex);
@@ -645,7 +1027,6 @@ void CameraHttpServer::udp_stream_task(void *arg)
             txChunks = 0;
             txErrors = 0;
         }
-
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 }

@@ -23,6 +23,8 @@ public:
     // Background task: capture frames and hand them to downstream consumers.
     void capture_task(void *arg);
 
+    static void operateCameraResetSequence();
+
 private:
     camera_config_t config;
 

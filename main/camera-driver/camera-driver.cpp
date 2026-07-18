@@ -62,17 +62,30 @@ void CameraDriver::configureCamera() {
     config.grab_mode = CAMERA_GRAB_LATEST;
 }
 
-esp_err_t CameraDriver::init() {
+esp_err_t CameraDriver::init() 
+{
     esp_err_t err = esp_camera_init(&config);
     if (err != ESP_OK) {
         ESP_LOGE(CAMERA_TAG, "Camera initialization failed: 0x%x", err);
     } else {
         ESP_LOGI(CAMERA_TAG, "Camera successfully initialized");
     }
+
+    // Flip image 180°
+    sensor_t *s = esp_camera_sensor_get();
+    if (s) {
+        s->set_vflip(s, 1);
+        s->set_hmirror(s, 1);
+        ESP_LOGI(OV2640_TAG, "Camera image flipped 180°");
+    } else {
+        ESP_LOGW(OV2640_TAG, "Failed to get camera sensor handle for flipping");
+    }
+
     return err;
 }
 
-camera_fb_t* CameraDriver::captureFrame() {
+camera_fb_t* CameraDriver::captureFrame() 
+{
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb) {
         ESP_LOGE(CAMERA_TAG, "Failed to capture frame");
@@ -82,7 +95,8 @@ camera_fb_t* CameraDriver::captureFrame() {
     return fb;
 }
 
-void CameraDriver::releaseFrame(camera_fb_t* fb) {
+void CameraDriver::releaseFrame(camera_fb_t* fb) 
+{
     if (fb) {
         esp_camera_fb_return(fb);
         ESP_LOGI(CAMERA_TAG, "Frame buffer released");
@@ -156,6 +170,20 @@ void CameraDriver::capture_task(void *arg)
         // Yield to networking/HTTP tasks to avoid burst-and-freeze behavior.
         vTaskDelay(pdMS_TO_TICKS(10));
     }
+}
+
+void CameraDriver::operateCameraResetSequence()
+{
+    gpio_reset_pin((gpio_num_t)PWDN_GPIO_NUM);
+    gpio_reset_pin((gpio_num_t)RESET_GPIO_NUM);
+    gpio_set_direction((gpio_num_t)PWDN_GPIO_NUM, GPIO_MODE_OUTPUT);
+    gpio_set_direction((gpio_num_t)RESET_GPIO_NUM, GPIO_MODE_OUTPUT);
+
+    gpio_set_level((gpio_num_t)PWDN_GPIO_NUM, 0);  // Power on
+    gpio_set_level((gpio_num_t)RESET_GPIO_NUM, 0); // Hold reset
+    vTaskDelay(pdMS_TO_TICKS(10));
+    gpio_set_level((gpio_num_t)RESET_GPIO_NUM, 1); // Release reset
+
 }
 
 
