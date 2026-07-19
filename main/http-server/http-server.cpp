@@ -284,6 +284,97 @@ esp_err_t CameraHttpServer::captureRgbTcpCallback(httpd_req_t *req, HttpFrameBuf
 esp_err_t CameraHttpServer::streamRgbTcpCallback(httpd_req_t *req, HttpFrameBuffer* frameBuffer, portMUX_TYPE* frameMetaLock)
 {
     esp_err_t res = ESP_OK;
+    char *part_buf = (char*)malloc(128);
+    if (!part_buf) {
+        ESP_LOGE("HTTP_STREAM", "Failed to allocate header buffer for streaming");
+        return ESP_ERR_NO_MEM;
+    }
+
+    #define STREAM_BOUNDARY "123456789000000000000987654321"
+    static const char* stream_boundary_str = "\r\n--" STREAM_BOUNDARY "\r\n";
+    
+    // 1. Prepare initial Multipart headers using framework methods
+    res = httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=" STREAM_BOUNDARY);
+    if (res != ESP_OK) { free(part_buf); return res; }
+    res = httpd_resp_set_hdr(req, "Connection", "keep-alive");
+    if (res != ESP_OK) { free(part_buf); return res; }
+    res = httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+    if (res != ESP_OK) { free(part_buf); return res; }
+    res = httpd_resp_set_hdr(req, "Pragma", "no-cache");
+    if (res != ESP_OK) { free(part_buf); return res; }
+    res = httpd_resp_set_hdr(req, "Expires", "0");
+    if (res != ESP_OK) { free(part_buf); return res; }
+
+    uint32_t lastSeenSeq = 0;
+    ESP_LOGI("HTTP_STREAM", "Started real-time multipart stream session");
+
+    // 2. Stream loop
+    while (true) {
+        size_t frameLength = 0;
+        uint8_t frameIndex = 0;
+        pixformat_t frameFormat; 
+        uint32_t frameSeq = 0;
+
+        // Check if a new frame is ready
+        taskENTER_CRITICAL(frameMetaLock);
+        frameSeq = frameBuffer->getActiveHttpFrameSeq();
+        taskEXIT_CRITICAL(frameMetaLock);
+
+        if (frameSeq == lastSeenSeq) {
+            vTaskDelay(1); // Crucial 10ms block keeps the task watchdog happy
+            continue;
+        }
+
+        // Extract metadata safely from the active double buffer
+        taskENTER_CRITICAL(frameMetaLock);
+        frameLength = frameBuffer->getActiveHttpFrameLength();
+        frameIndex = frameBuffer->getActiveHttpFrameIndex();
+        frameFormat = frameBuffer->getActiveHttpFrameFormat();
+        taskEXIT_CRITICAL(frameMetaLock);
+
+        // Read directly from the active buffer
+        const uint8_t *sendPtr = frameBuffer->getBuffer(frameIndex);
+        if (!sendPtr || frameLength == 0) {
+            vTaskDelay(1);
+            continue;
+        }
+
+        // STEP A: Send the leading frame separator and boundary string
+        res = httpd_resp_send_chunk(req, stream_boundary_str, strlen(stream_boundary_str));
+        if (res != ESP_OK) break;
+
+        // STEP B: Format clean content headers for this frame part
+        int hlen = snprintf(part_buf, 128,
+            "Content-Type: %s\r\n"
+            "Content-Length: %zu\r\n"
+            "\r\n",
+            (frameFormat == 4) ? "image/jpeg" : "application/octet-stream", // 4 maps to PIXFORMAT_JPEG
+            frameLength
+        );
+
+        // STEP C: Send image content headers
+        res = httpd_resp_send_chunk(req, part_buf, hlen);
+        if (res != ESP_OK) break;
+
+        // STEP D: Send binary JPEG payload
+        res = httpd_resp_send_chunk(req, (const char*)sendPtr, frameLength);
+        if (res != ESP_OK) break;
+
+        lastSeenSeq = frameSeq;
+    } 
+
+    ESP_LOGI("HTTP_STREAM", "Multipart stream session ended");
+    free(part_buf);
+    
+    // Finalize the chunked stream cleanly for the framework
+    httpd_resp_send_chunk(req, nullptr, 0);
+    return res;
+}
+
+// HTTP handler, keeps one connection open and streams frames continuously, uses httpd_resp_send_chunk (HTTP multipart over TCP)
+/*esp_err_t CameraHttpServer::streamRgbTcpCallback(httpd_req_t *req, HttpFrameBuffer* frameBuffer, portMUX_TYPE* frameMetaLock)
+{
+    esp_err_t res = ESP_OK;
     char *part_buf = (char*)malloc(256);
     if (!part_buf) {
         ESP_LOGE("HTTP_STREAM", "Failed to allocate header buffer for streaming");
@@ -323,7 +414,7 @@ esp_err_t CameraHttpServer::streamRgbTcpCallback(httpd_req_t *req, HttpFrameBuff
         pixformat_t frameFormat; // = PIXFORMAT_GRAYSCALE;
         uint32_t frameSeq = 0;
         int64_t framePublishUs = 0;
-
+        
         // Check if a new frame is ready
         ESP_LOGD(HTTP_TAG, "Waiting for new frame to stream, lastSeenSeq=%lu", (unsigned long)lastSeenSeq);
         taskENTER_CRITICAL(frameMetaLock);
@@ -357,24 +448,24 @@ esp_err_t CameraHttpServer::streamRgbTcpCallback(httpd_req_t *req, HttpFrameBuff
         const int64_t ageUs = (framePublishUs > 0 && nowUs > framePublishUs) ? (nowUs - framePublishUs) : 0;
 
         // Format multipart headers for this individual frame, including telemetry
-        /*int hlen = snprintf(part_buf, 256,
-            "--" STREAM_BOUNDARY "\r\n"
-            "Content-Type: %s\r\n"
-            "Content-Length: %zu\r\n"
-            "X-Frame-Seq: %lu\r\n"
-            "X-Frame-Age-Ms: %lld\r\n"
-            "X-Frame-Width: %d\r\n"
-            "X-Frame-Height: %d\r\n"
-            "X-Frame-Format: %s\r\n"
-            "\r\n",
-            (frameFormat == PIXFORMAT_JPEG) ? "image/jpeg" : "application/octet-stream",
-            (size_t)frameLength,
-            (unsigned long)frameSeq,
-            (long long)(ageUs / 1000),
-            (int)frameWidth,
-            (int)frameHeight,
-            (frameFormat == PIXFORMAT_JPEG) ? "jpeg" : "gray8"
-        );*/
+        //int hlen = snprintf(part_buf, 256,
+        //    "--" STREAM_BOUNDARY "\r\n"
+        //    "Content-Type: %s\r\n"
+        //    "Content-Length: %zu\r\n"
+        //   "X-Frame-Seq: %lu\r\n"
+        //    "X-Frame-Age-Ms: %lld\r\n"
+        //    "X-Frame-Width: %d\r\n"
+        //    "X-Frame-Height: %d\r\n"
+        //    "X-Frame-Format: %s\r\n"
+        //    "\r\n",
+        //    (frameFormat == PIXFORMAT_JPEG) ? "image/jpeg" : "application/octet-stream",
+        //    (size_t)frameLength,
+        //    (unsigned long)frameSeq,
+        //    (long long)(ageUs / 1000),
+        //    (int)frameWidth,
+        //    (int)frameHeight,
+        //    (frameFormat == PIXFORMAT_JPEG) ? "jpeg" : "gray8"
+        //);
         // Format clean multipart headers for this individual frame
         int hlen = snprintf(part_buf, 256,
             "--" STREAM_BOUNDARY "\r\n"
@@ -407,13 +498,12 @@ esp_err_t CameraHttpServer::streamRgbTcpCallback(httpd_req_t *req, HttpFrameBuff
                  (long long)(ageUs / 1000));
 
         lastSeenSeq = frameSeq;
-    }
+    } // End of while loop
 
     ESP_LOGI("HTTP_STREAM", "Multipart stream session ended: %s", esp_err_to_name(res));
     free(part_buf);
     return res;
-}
-
+}*/
 
 #pragma region INDEX_HTML
 // HTML page for live view using <canvas>
