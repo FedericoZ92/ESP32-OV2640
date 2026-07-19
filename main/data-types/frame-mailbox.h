@@ -28,7 +28,7 @@ public:
     FrameMailboxManager(FrameMailbox* mailbox, size_t publishedFrameMaxBytes);
     ~FrameMailboxManager() = default;
     bool initFrameMailbox(const char* tag, uint32_t caps);
-    void publish( const uint8_t* src,
+    void publish( const uint8_t* cameraFrameSrc,
                     size_t srcLen,
                     uint16_t width,
                     uint16_t height,

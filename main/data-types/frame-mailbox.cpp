@@ -40,14 +40,14 @@ bool FrameMailboxManager::initFrameMailbox(const char* tag, uint32_t caps) //cap
     return true;
 }
 
-void FrameMailboxManager::publish(const uint8_t* src,
+void FrameMailboxManager::publish(const uint8_t* cameraFrameSrc,
                                     size_t srcLen,
                                     uint16_t width,
                                     uint16_t height,
                                     pixformat_t format,
                                     int64_t captureUs)
 {
-    if (!src || !mailbox || srcLen == 0) {
+    if (!cameraFrameSrc || !mailbox || srcLen == 0) {
         return;
     }
 
@@ -66,7 +66,7 @@ void FrameMailboxManager::publish(const uint8_t* src,
         return;
     }
 
-    memcpy(mailbox->buffers[publishIndex], src, frameLen);
+    memcpy(mailbox->buffers[publishIndex], cameraFrameSrc, frameLen);
     taskENTER_CRITICAL(&mailbox->lock);
     mailbox->frameLen = frameLen;
     mailbox->frameWidth = width;

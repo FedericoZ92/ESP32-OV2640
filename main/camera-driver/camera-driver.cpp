@@ -5,10 +5,8 @@
 #include "debug.h"
 #include "app-globals.h"
 #include "data-types/frame-mailbox.h"
-#include "gpio-config.h"
 #include <driver/gpio.h>
 #include <esp_timer.h>
-
 
 #define PWDN_GPIO_NUM     -1   // Power down not used
 #define RESET_GPIO_NUM    -1   // Reset not used
@@ -60,14 +58,17 @@ void CameraDriver::configureCamera() {
     config.pixel_format = PIXFORMAT_JPEG; //PIXFORMAT_JPEG; //PIXFORMAT_GRAYSCALE; 
     //IMAGE_FRAME_SIZE_FOR_INFERENCE; // FRAMESIZE_QQVGA; //used with inference
     config.frame_size = FRAMESIZE_QQVGA;
-    config.jpeg_quality = 12;
-    config.fb_count = 3;
+    config.jpeg_quality = 15; //0-63 lower number means higher quality
+    config.fb_count = 2;
     config.fb_location = CAMERA_FB_IN_PSRAM; //Store in internal RAM
     config.grab_mode = CAMERA_GRAB_LATEST;
 }
 
-esp_err_t CameraDriver::init() 
+esp_err_t CameraDriver::init(FrameMailboxManager* streamMailboxManagerPtr, FrameMailboxManager* inferenceMailboxManagerPtr) 
 {
+    streamMailboxManagerPtr_ = streamMailboxManagerPtr;
+    inferenceMailboxManagerPtr_ = inferenceMailboxManagerPtr;
+
     esp_err_t err = esp_camera_init(&config);
     if (err != ESP_OK) {
         ESP_LOGE(CAMERA_TAG, "Camera initialization failed: 0x%x", err);
@@ -107,10 +108,21 @@ void CameraDriver::releaseFrame(camera_fb_t* fb)
     }
 }
 
+FrameMailboxManager* CameraDriver::getMutableStreamMailboxManagerPtr() 
+{ 
+    return streamMailboxManagerPtr_; 
+}
+
+FrameMailboxManager* CameraDriver::getMutableInferenceMailboxManagerPtr() 
+{ 
+    return inferenceMailboxManagerPtr_; 
+}
+
 // Background task: capture frames and hand them to downstream consumers.
-void CameraDriver::capture_task(void *arg)
+void CameraDriver::capture_task(CameraDriver* cameraPtr)
 {
     ESP_LOGI(CAPTURE_TAG, "Camera capture task started");
+    // CameraDriver* cameraPtr = static_cast<CameraDriver*>(arg);
     uint32_t capturedFrames = 0;
     int64_t captureWindowStartUs = esp_timer_get_time();
 
@@ -136,22 +148,22 @@ void CameraDriver::capture_task(void *arg)
         const int64_t captureUs = esp_timer_get_time();
 
         #if ENABLE_RGB_STREAM_TASK
-            streamMailboxManager.publish(
-                                frameBuffer->buf,
-                                frameBuffer->len,
-                                frameBuffer->width,
-                                frameBuffer->height,
-                                frameBuffer->format,
-                                captureUs);
+            cameraPtr->getMutableStreamMailboxManagerPtr()->publish(
+                                                                    frameBuffer->buf,
+                                                                    frameBuffer->len,
+                                                                    frameBuffer->width,
+                                                                    frameBuffer->height,
+                                                                    frameBuffer->format,
+                                                                    captureUs);
         #endif
         #if ENABLE_INFERENCE
-            inferenceMailboxManager.publish(
-                                frameBuffer->buf,
-                                frameBuffer->len,
-                                frameBuffer->width,
-                                frameBuffer->height,
-                                frameBuffer->format,
-                                captureUs);
+            cameraPtr->getMutableInferenceMailboxManagerPtr()->publish(
+                                                                    frameBuffer->buf,
+                                                                    frameBuffer->len,
+                                                                    frameBuffer->width,
+                                                                    frameBuffer->height,
+                                                                    frameBuffer->format,
+                                                                    captureUs);
         #endif
 
         capturedFrames++;
@@ -176,21 +188,6 @@ void CameraDriver::capture_task(void *arg)
     }
 }
 
-void CameraDriver::operateCameraResetSequence()
-{
-    /*
-    gpio_reset_pin((gpio_num_t)PWDN_GPIO_NUM);
-    gpio_set_direction((gpio_num_t)PWDN_GPIO_NUM, GPIO_MODE_OUTPUT);
-    gpio_set_level((gpio_num_t)PWDN_GPIO_NUM, 0);  // Power on
 
-    gpio_reset_pin((gpio_num_t)RESET_GPIO_NUM);
-    gpio_set_direction((gpio_num_t)RESET_GPIO_NUM, GPIO_MODE_OUTPUT);
-    gpio_set_level((gpio_num_t)RESET_GPIO_NUM, 0); // Hold reset
-    
-    vTaskDelay(pdMS_TO_TICKS(10));
-    
-    gpio_set_level((gpio_num_t)RESET_GPIO_NUM, 1); // Release reset
-    */
-}
 
 

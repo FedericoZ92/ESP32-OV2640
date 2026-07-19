@@ -97,10 +97,7 @@ extern "C" void app_main(void)
     }
     ESP_LOGI(OV2640_TAG, "Flash size: %" PRIu32 " MB, PSRAM size: %" PRIu32 " MB", flash_size / (1024 * 1024), (uint32_t)(PSRAM::getSize() / (1024 * 1024)));
 
-    // --- Camera reset sequence ---
-    CameraDriver::operateCameraResetSequence();
-    vTaskDelay(pdMS_TO_TICKS(100));
-
+    // --- Wi-Fi initialization ---
     log_RAM_status("pre Wi-Fi initialization"); // TODO restore
 
     // --- Wi-Fi initialization ---
@@ -118,8 +115,19 @@ extern "C" void app_main(void)
     }
 
     // --- Camera initialization ---
+    #if ENABLE_RGB_STREAM_TASK
+        if (!streamMailboxManager.initFrameMailbox("stream", MALLOC_CAP_SPIRAM)) {
+            return;
+        }
+    #endif
+    #if ENABLE_INFERENCE
+        if (!inferenceMailboxManager.initFrameMailbox("inference", MALLOC_CAP_SPIRAM)) {
+            return;
+        }
+    #endif
+
     static CameraDriver camera;
-    if (camera.init() != ESP_OK) {
+    if (camera.init(&streamMailboxManager, &inferenceMailboxManager) != ESP_OK) {
         ESP_LOGE(OV2640_TAG, "Camera initialization failed");
         return;
     }
@@ -134,17 +142,6 @@ extern "C" void app_main(void)
     appTaskContext.streamMailboxManager = &streamMailboxManager;
     appTaskContext.inferenceMailboxManager = &inferenceMailboxManager;
     appTaskContext.httpFrameMetaLock = &httpFrameMetaLock;
-
-    #if ENABLE_RGB_STREAM_TASK
-        if (!streamMailboxManager.initFrameMailbox("stream", MALLOC_CAP_SPIRAM)) {
-            return;
-        }
-    #endif
-    #if ENABLE_INFERENCE
-        if (!inferenceMailboxManager.initFrameMailbox("inference", MALLOC_CAP_SPIRAM)) {
-            return;
-        }
-    #endif
 
     // HTTP server task (always on; transport-specific handlers are configured below).
     auto http_server_task = [](void* arg) {
@@ -256,7 +253,7 @@ extern "C" void app_main(void)
                                 [](void* arg) {
                                     CameraDriver* cameraPtr = static_cast<CameraDriver*>(arg);
                                     if (cameraPtr) {
-                                        cameraPtr->capture_task(arg);
+                                        cameraPtr->capture_task(cameraPtr);
                                     }
                                 },
                                 "capture_task",
