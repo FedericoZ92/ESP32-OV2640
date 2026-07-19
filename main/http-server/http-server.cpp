@@ -11,6 +11,130 @@
 #include "http-server/udp-fram-header.h"
 #include <sys/socket.h>
 
+////https://github.com/espressif/arduino-esp32/blob/master/libraries/ESP32/examples/Camera/CameraWebServer/app_httpd.cpp
+
+/*
+Comparing your project architecture with the official Espressif `CameraWebServer` example reveals a major discrepancy in how image data moves through memory.
+
+While the official example streams video smoothly, your setup triggers bus collisions that cause the hardware to truncate frames (`cam_hal: NO-EOI`) and freeze the browser feed.
+
+---
+
+### 1. Code Architecture: Zero-Copy vs. Multi-Stage `memcpy`
+
+#### How Espressif's `app_httpd.cpp` works:
+
+The official Espressif code is a **zero-copy pipeline**.
+
+1. The HTTP streaming thread calls `fb = esp_camera_fb_get();`. This fetches a direct pointer to the raw DMA memory buffer allocated inside the camera driver.
+2. The code passes this pointer straight to the network stack: `httpd_resp_send_chunk(req, fb->buf, fb->len);`.
+3. It immediately releases the buffer back to the hardware: `esp_camera_fb_return(fb);`.
+
+* **Total memory operations:** 0 copies. Data moves straight from the camera hardware register into the Wi-Fi transmission queue. No auxiliary tasks or threads are involved.
+
+#### How your code (`source: 24`) works:
+
+Your project splits frame handling across several tasks, creating a high-overhead relay chain:
+
+1. Your camera capture task fetches a frame, then calls `streamMailboxManager.publish()`, which runs a **`memcpy`** into a secondary mailbox buffer.
+
+
+2. A separate background task (`http_stream_publish_task`) wakes up, takes a snapshot, and executes a **second `memcpy**` to push it into a third store (`httpFrameBuffer`).
+
+
+3. Finally, your HTTP thread (`streamRgbTcpCallback`) wakes up, accesses that third buffer, and transmits it over the network.
+
+
+
+* **Total memory operations:** 2 complete frame-to-frame memory copies on every iteration, driven by concurrent FreeRTOS tasks fighting for CPU cycles.
+
+
+
+---
+
+### 2. `sdkconfig` Configuration Analysis
+
+Your `sdkconfig` file exposes why this multi-copy architecture causes the camera driver to fail.
+
+#### Memory Bus Constraints
+
+```text
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_40M=y
+
+```
+
+Your Octal PSRAM is configured to run at **40 MHz**. At this frequency, the external memory bus has a strict bandwidth limit.
+
+#### Core & Interrupt Contention
+
+```text
+CONFIG_CAMERA_CORE0=y
+CONFIG_WIFI_TASK_PINNED_TO_CORE_0=y
+
+```
+
+Both your camera driver hardware interrupts and your core Wi-Fi network stack are pinned to **Core 0**.
+
+---
+
+### 3. Why `NO-EOI` and Freezes Occur
+
+When a camera frame arrives, the hardware DMA controller writes pixel bytes directly into PSRAM over the external bus.
+
+While this hardware transfer is actively running on Core 0, your CPU tasks (`capture_task` and `http_stream_publish_task`) run back-to-back **`memcpy` operations** on large imagery blocks. Because your memory bus is clocked down to 40 MHz, the CPU's memory copies completely saturate the PSRAM bus bandwidth.
+
+This causes severe bus contention. The hardware DMA controller gets starved of access to the PSRAM bus, fills its internal FIFO buffer, and drops incoming data from the camera sensor. Because bytes are lost mid-transfer, the camera driver misses the final JPEG End-of-Image marker, producing the `cam_hal: NO-EOI` hardware error.
+
+**Why the stream freezes:** Your HTTP loop successfully sends the headers and data length to the browser. However, because the data block is physically truncated and missing its closing marker, the browser's JPEG renderer encounters an invalid file structure. It cannot decode the frame transitions properly, causing the video element to drop the connection and permanently freeze.
+
+---
+
+### How to Align with the Official Example
+
+To eliminate this memory bus contention, you must bypass the intermediate task layers and read directly from the camera driver inside your streaming loop.
+
+Update the `while (true)` loop inside `streamRgbTcpCallback` to fetch frames straight from the driver, matching the official Espressif implementation:
+
+```cpp
+    while (true) {
+        // 1. Fetch the frame directly from the camera driver (Zero-Copy)
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (!fb) {
+            vTaskDelay(1);
+            continue;
+        }
+
+        // STEP A: Send the frame separator boundary
+        res = httpd_resp_send_chunk(req, "\r\n--" STREAM_BOUNDARY "\r\n", 34);
+        if (res != ESP_OK) { esp_camera_fb_return(fb); break; }
+
+        // STEP B: Format content headers using the live driver buffer length
+        int hlen = snprintf(part_buf, 128,
+            "Content-Type: image/jpeg\r\n"
+            "Content-Length: %zu\r\n"
+            "\r\n",
+            fb->len
+        );
+
+        // STEP C: Send inner part headers
+        res = httpd_resp_send_chunk(req, part_buf, hlen);
+        if (res != ESP_OK) { esp_camera_fb_return(fb); break; }
+
+        // STEP D: Transmit the raw hardware buffer directly over the socket
+        res = httpd_resp_send_chunk(req, (const char*)fb->buf, fb->len);
+        
+        // 2. Return the buffer to the hardware driver immediately
+        esp_camera_fb_return(fb);
+        
+        if (res != ESP_OK) break;
+    }
+
+```
+
+Bypassing the intermediate mailbox and snapshot layers eliminates the CPU memory thrashing that blocks the camera's DMA engine, stopping the hardware truncation errors and restoring a fluid visual stream.
+*/
+
 CameraHttpServer::CaptureCallback CameraHttpServer::s_captureCallback = nullptr;
 CameraHttpServer::StreamCallback CameraHttpServer::s_streamCallback = nullptr;
 
@@ -291,7 +415,6 @@ esp_err_t CameraHttpServer::streamRgbTcpCallback(httpd_req_t *req, HttpFrameBuff
     }
 
     #define STREAM_BOUNDARY "123456789000000000000987654321"
-    static const char* stream_boundary_str = "\r\n--" STREAM_BOUNDARY "\r\n";
     
     // 1. Prepare initial Multipart headers using framework methods
     res = httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=" STREAM_BOUNDARY);
@@ -321,7 +444,7 @@ esp_err_t CameraHttpServer::streamRgbTcpCallback(httpd_req_t *req, HttpFrameBuff
         taskEXIT_CRITICAL(frameMetaLock);
 
         if (frameSeq == lastSeenSeq) {
-            vTaskDelay(1); // Crucial 10ms block keeps the task watchdog happy
+            vTaskDelay(1); // 10ms block ensures task watchdog resets properly
             continue;
         }
 
@@ -339,18 +462,22 @@ esp_err_t CameraHttpServer::streamRgbTcpCallback(httpd_req_t *req, HttpFrameBuff
             continue;
         }
 
-        // STEP A: Send the leading frame separator and boundary string
-        res = httpd_resp_send_chunk(req, stream_boundary_str, strlen(stream_boundary_str));
+        // STEP A: Send the frame separator and boundary string together as a single atomic chunk
+        res = httpd_resp_send_chunk(req, "\r\n--" STREAM_BOUNDARY "\r\n", 34);
         if (res != ESP_OK) break;
 
-        // STEP B: Format clean content headers for this frame part
+        // STEP B: Format clean inner content headers for this individual frame part
         int hlen = snprintf(part_buf, 128,
-            "Content-Type: %s\r\n"
+            "Content-Type: image/jpeg\r\n"
             "Content-Length: %zu\r\n"
             "\r\n",
-            (frameFormat == 4) ? "image/jpeg" : "application/octet-stream", // 4 maps to PIXFORMAT_JPEG
             frameLength
         );
+        if (hlen <= 0 || hlen >= 128) {
+            ESP_LOGE("HTTP_STREAM", "Failed to format multipart header");
+            res = ESP_FAIL;
+            break;
+        }
 
         // STEP C: Send image content headers
         res = httpd_resp_send_chunk(req, part_buf, hlen);
@@ -366,7 +493,7 @@ esp_err_t CameraHttpServer::streamRgbTcpCallback(httpd_req_t *req, HttpFrameBuff
     ESP_LOGI("HTTP_STREAM", "Multipart stream session ended");
     free(part_buf);
     
-    // Finalize the chunked stream cleanly for the framework
+    // Finalize the chunked stream cleanly
     httpd_resp_send_chunk(req, nullptr, 0);
     return res;
 }
