@@ -63,7 +63,8 @@ void HttpFrameBuffer::publishHttpFrame(const uint8_t* src,
     }
 
     memcpy(buffers[publishIndex], src, frameLen);
-
+    ESP_LOGD(HTTP_TAG, "Publish HTTP frame");
+    
     taskENTER_CRITICAL(&httpFrameMetaLock);
     activeHttpFrameLength = frameLen;
     activeHttpFrameWidth = width;
@@ -73,6 +74,14 @@ void HttpFrameBuffer::publishHttpFrame(const uint8_t* src,
     activeHttpFrameSeq++;
     activeHttpFramePublishUs = publishUs;
     taskEXIT_CRITICAL(&httpFrameMetaLock);
+
+    ESP_LOGD(HTTP_TAG, "Published HTTP frame metadata updated: seq=%lu, len=%u, %dx%d, format=%d, publishUs=%lld",
+             (unsigned long)activeHttpFrameSeq,
+             (unsigned int)activeHttpFrameLength,
+             (unsigned int)activeHttpFrameWidth,
+             (unsigned int)activeHttpFrameHeight,
+             (int)activeHttpFrameFormat,
+             (long long)activeHttpFramePublishUs);
 
     #if STOP_ACQUISITION_AFTER_1_FRAME
         if (activeHttpFrameSeq == 1) {

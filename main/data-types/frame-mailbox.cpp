@@ -88,6 +88,7 @@ bool FrameMailboxManager::snapshot(FrameSnapshot* snapshot)
         return false;
     }
 
+    ESP_LOGD(MAIN_TAG, "Snapshotting mailbox %s", mailbox->tag ? mailbox->tag : "unknown");
     taskENTER_CRITICAL(&mailbox->lock);
     const uint8_t activeIndex = mailbox->activeIndex;
     snapshot->len = mailbox->frameLen;
@@ -97,6 +98,13 @@ bool FrameMailboxManager::snapshot(FrameSnapshot* snapshot)
     snapshot->seq = mailbox->frameSeq;
     snapshot->captureUs = mailbox->frameCaptureUs;
     taskEXIT_CRITICAL(&mailbox->lock);
+    ESP_LOGD(MAIN_TAG, "Snapshot: seq=%lu, len=%u, %dx%d, format=%d, captureUs=%lld",
+             (unsigned long)snapshot->seq,
+             (unsigned int)snapshot->len,
+             (unsigned int)snapshot->width,
+             (unsigned int)snapshot->height,
+             (int)snapshot->format,
+             (long long)snapshot->captureUs);
 
     snapshot->data = mailbox->buffers[activeIndex];
     return snapshot->data != nullptr && snapshot->len > 0;

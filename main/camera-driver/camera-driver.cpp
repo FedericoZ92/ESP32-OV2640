@@ -137,6 +137,9 @@ void CameraDriver::capture_task(CameraDriver* cameraPtr)
         ESP_LOGD(CAPTURE_TAG, "Handle JPEG decoding or raw frame, mark checkpoint"); 
         cameraAcquisitionTimer.checkpoint();
         camera_fb_t *frameBuffer = esp_camera_fb_get();
+
+        vTaskDelay(pdMS_TO_TICKS(50));
+
         if (!frameBuffer) {
             ESP_LOGW(CAPTURE_TAG, "Failed to get frame buffer");
             vTaskDelay(pdMS_TO_TICKS(100));

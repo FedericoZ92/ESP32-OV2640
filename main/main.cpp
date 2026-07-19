@@ -51,15 +51,6 @@ CheckpointTimer cameraAcquisitionTimer;
 CheckpointTimer tensorFlowTimer;
 CheckpointTimer httpTimer;
 
-// --- Shared static frame buffer ---
-/*static uint8_t* httpFrameBuffers[2] = {nullptr, nullptr};
-static volatile uint8_t activeHttpFrameIndex = 0;
-static volatile size_t activeHttpFrameLen = 0;
-static volatile uint16_t activeHttpFrameWidth = TF_IMAGE_INPUT_SIZE;
-static volatile uint16_t activeHttpFrameHeight = TF_IMAGE_INPUT_SIZE;
-static volatile pixformat_t activeHttpFrameFormat = PIXFORMAT_GRAYSCALE;
-static volatile uint32_t activeHttpFrameSeq = 0;
-static volatile int64_t activeHttpFramePublishUs = 0;*/
 HttpFrameBuffer httpFrameBuffer(kPublishedFrameMaxBytes);
 
 volatile bool pauseCameraAcquisition = false;
@@ -76,9 +67,10 @@ FrameMailboxManager streamMailboxManager(&streamMailbox, kPublishedFrameMaxBytes
 extern "C" void app_main(void)
 {
     esp_log_level_set("*", ESP_LOG_WARN);
-    esp_log_level_set(OV2640_TAG, ESP_LOG_INFO);
-    esp_log_level_set("WifiManager", ESP_LOG_INFO);
-    esp_log_level_set("CameraHttpServer", ESP_LOG_INFO);
+    //esp_log_level_set(OV2640_TAG, ESP_LOG_INFO);
+    //esp_log_level_set(MAIN_TAG, ESP_LOG_DEBUG);
+    //esp_log_level_set(CAPTURE_TAG, ESP_LOG_INFO);
+    //esp_log_level_set(HTTP_TAG, ESP_LOG_DEBUG);
 
     // --- Print chip info ---
     esp_chip_info_t chip_info;
@@ -166,7 +158,7 @@ extern "C" void app_main(void)
         "http_server_task",
         4096,
         NULL,
-        5,
+        6,
         NULL,
         CORE_ID_HTTP_SERVER
     );
@@ -200,9 +192,9 @@ extern "C" void app_main(void)
             "http_stream_publish_task",
             6144,
             &appTaskContext,
-            5,
+            6,
             &streamMailbox.consumerTaskHandle,
-            tskNO_AFFINITY
+            CORE_ID_HTTP_SERVER
         );
         ESP_LOGI(OV2640_TAG, "Started stream publish task");
     #else
@@ -259,7 +251,7 @@ extern "C" void app_main(void)
                                 "capture_task",
                                 4096,
                                 &camera,
-                                5,
+                                7,
                                 NULL,
                                 1); //xCoreID 0 for main core, 1 for app core
         ESP_LOGI(OV2640_TAG, "Started camera acquisition task");

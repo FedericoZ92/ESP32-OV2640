@@ -55,11 +55,13 @@ esp_err_t CameraHttpServer::captureRgbTcpCallback(httpd_req_t *req, HttpFrameBuf
 
     size_t frameLength = 0;
     uint8_t frameIndex = 0;
-    uint16_t frameWidth = TF_IMAGE_INPUT_SIZE;
-    uint16_t frameHeight = TF_IMAGE_INPUT_SIZE;
-    pixformat_t frameFormat = PIXFORMAT_GRAYSCALE;
+    uint16_t frameWidth = 0; //TF_IMAGE_INPUT_SIZE;
+    uint16_t frameHeight = 0; // TF_IMAGE_INPUT_SIZE
+    pixformat_t frameFormat; // = PIXFORMAT_GRAYSCALE; 
     uint32_t frameSeq = 0;
     int64_t framePublishUs = 0;
+
+    ESP_LOGD(HTTP_TAG, "Capture request received, seq=%lu", (unsigned long)httpReqWindowLastSeq + 1);
     taskENTER_CRITICAL(frameMetaLock);
     frameLength = frameBuffer->getActiveHttpFrameLength();
     frameIndex = frameBuffer->getActiveHttpFrameIndex();
@@ -69,6 +71,13 @@ esp_err_t CameraHttpServer::captureRgbTcpCallback(httpd_req_t *req, HttpFrameBuf
     frameSeq = frameBuffer->getActiveHttpFrameSeq();
     framePublishUs = frameBuffer->getActiveHttpFramePublishUs();
     taskEXIT_CRITICAL(frameMetaLock);
+    ESP_LOGD(HTTP_TAG, "Capture request metadata: seq=%lu, len=%u, %dx%d, format=%d, publishUs=%lld",
+             (unsigned long)frameSeq,
+             (unsigned int)frameLength,
+             (unsigned int)frameWidth,
+             (unsigned int)frameHeight,
+             (int)frameFormat,
+             (long long)framePublishUs);
 
     if (frameFormat == PIXFORMAT_JPEG) {
         httpd_resp_set_type(req, "image/jpeg");
@@ -295,12 +304,12 @@ esp_err_t CameraHttpServer::streamRgbTcpCallback(httpd_req_t *req, HttpFrameBuff
     res = httpd_resp_set_hdr(req, "Expires", "0");
     if (res != ESP_OK) { free(part_buf); return res; }
 
-    // 2. FORCE-FLUSH HEADERS IMMEDIATELY
-    // Sending a tiny, harmless 2-byte chunk (\r\n) triggers the HTTP server 
-    // to instantly send the HTTP "200 OK" and headers to the browser.
-    // This transitions the browser UI from "Connecting..." to "Streaming active...".
-    res = httpd_resp_send_chunk(req, "\r\n", 2);
-    if (res != ESP_OK) { free(part_buf); return res; }
+    //// 2. FORCE-FLUSH HEADERS IMMEDIATELY
+    //// Sending a tiny, harmless 2-byte chunk (\r\n) triggers the HTTP server 
+    //// to instantly send the HTTP "200 OK" and headers to the browser.
+    //// This transitions the browser UI from "Connecting..." to "Streaming active...".
+    //res = httpd_resp_send_chunk(req, "\r\n", 2);
+    //if (res != ESP_OK) { free(part_buf); return res; }
 
     uint32_t lastSeenSeq = 0;
     ESP_LOGI("HTTP_STREAM", "Started real-time multipart stream session");
@@ -309,13 +318,14 @@ esp_err_t CameraHttpServer::streamRgbTcpCallback(httpd_req_t *req, HttpFrameBuff
     while (true) {
         size_t frameLength = 0;
         uint8_t frameIndex = 0;
-        uint16_t frameWidth = TF_IMAGE_INPUT_SIZE;
-        uint16_t frameHeight = TF_IMAGE_INPUT_SIZE;
-        pixformat_t frameFormat = PIXFORMAT_GRAYSCALE;
+        uint16_t frameWidth = 0; // TF_IMAGE_INPUT_SIZE
+        uint16_t frameHeight = 0; // TF_IMAGE_INPUT_SIZE
+        pixformat_t frameFormat; // = PIXFORMAT_GRAYSCALE;
         uint32_t frameSeq = 0;
         int64_t framePublishUs = 0;
 
         // Check if a new frame is ready
+        ESP_LOGD(HTTP_TAG, "Waiting for new frame to stream, lastSeenSeq=%lu", (unsigned long)lastSeenSeq);
         taskENTER_CRITICAL(frameMetaLock);
         frameSeq = frameBuffer->getActiveHttpFrameSeq();
         taskEXIT_CRITICAL(frameMetaLock);
@@ -347,7 +357,7 @@ esp_err_t CameraHttpServer::streamRgbTcpCallback(httpd_req_t *req, HttpFrameBuff
         const int64_t ageUs = (framePublishUs > 0 && nowUs > framePublishUs) ? (nowUs - framePublishUs) : 0;
 
         // Format multipart headers for this individual frame, including telemetry
-        int hlen = snprintf(part_buf, 256,
+        /*int hlen = snprintf(part_buf, 256,
             "--" STREAM_BOUNDARY "\r\n"
             "Content-Type: %s\r\n"
             "Content-Length: %zu\r\n"
@@ -364,6 +374,15 @@ esp_err_t CameraHttpServer::streamRgbTcpCallback(httpd_req_t *req, HttpFrameBuff
             (int)frameWidth,
             (int)frameHeight,
             (frameFormat == PIXFORMAT_JPEG) ? "jpeg" : "gray8"
+        );*/
+        // Format clean multipart headers for this individual frame
+        int hlen = snprintf(part_buf, 256,
+            "--" STREAM_BOUNDARY "\r\n"
+            "Content-Type: %s\r\n"
+            "Content-Length: %zu\r\n"
+            "\r\n",
+            (frameFormat == PIXFORMAT_JPEG) ? "image/jpeg" : "application/octet-stream",
+            (size_t)frameLength
         );
 
         // Send boundary and custom headers
@@ -377,6 +396,15 @@ esp_err_t CameraHttpServer::streamRgbTcpCallback(httpd_req_t *req, HttpFrameBuff
         // Terminate part with a carriage return line feed
         res = httpd_resp_send_chunk(req, "\r\n", 2);
         if (res != ESP_OK) break;
+
+        ESP_LOGD("HTTP_STREAM", "Streamed frame: seq=%lu, index=%u, len=%zu, %dx%d, format=%d, age_ms=%lld",
+                 (unsigned long)frameSeq,
+                 frameIndex,
+                 frameLength,
+                 (int)frameWidth,
+                 (int)frameHeight,
+                 (int)frameFormat,
+                 (long long)(ageUs / 1000));
 
         lastSeenSeq = frameSeq;
     }
@@ -424,7 +452,27 @@ static const char *INDEX_HTML = R"rawliteral(
     freezeToggle.addEventListener('change', syncFreeze);
   </script>
 )rawliteral";
-#else
+#elif USE_TCP_STREAMING
+static const char *INDEX_HTML = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ESP32 Camera Live View</title>
+  <style>
+    body { font-family: sans-serif; margin: 20px; text-align: center; }
+    img { display: block; margin: 20px auto; background: #000; max-width: 100%; height: auto; }
+  </style>
+</head>
+<body>
+  <h2>ESP32 Camera Live View (Streaming)</h2>
+  <!-- Point the image src directly to the streaming endpoint -->
+  <img src="/stream.rgb" alt="Live Stream">
+</body>
+</html>
+)rawliteral";
+#elif USE_TCP_POLLING
 static const char *INDEX_HTML = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -619,6 +667,7 @@ esp_err_t CameraHttpServer::start(uint16_t port)
     config.max_open_sockets = 7; // Ensure enough sockets are open
     config.server_port = port;
     config.ctrl_port = port + 1000; // avoid conflict
+    config.max_uri_handlers = 12;
 
     esp_err_t err = httpd_start(&serverHandle, &config);
     if (err != ESP_OK) {

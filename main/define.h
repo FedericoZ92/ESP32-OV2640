@@ -40,6 +40,9 @@
 #define USE_TCP 1
 #define USE_UDP 0
 
+#define USE_TCP_STREAMING 1
+#define USE_TCP_POLLING 0
+
 // UDP stream settings (used only when USE_UDP=1).
 #define UDP_STREAM_PORT 5001
 #define UDP_STREAM_MAX_PAYLOAD 1024
